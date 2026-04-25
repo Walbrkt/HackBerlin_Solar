@@ -8,8 +8,11 @@ All colors MUST be HSL.
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
+    --background: 220 20% 97%;
     --foreground: 222.2 84% 4.9%;
+
+    --solar-panel: 220 70% 22%;
+    --solar-panel-hover: 220 80% 35%;
 
     --card: 0 0% 100%;
     --card-foreground: 222.2 84% 4.9%;
