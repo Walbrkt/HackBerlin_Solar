@@ -29,7 +29,8 @@ const PANEL_GAP = 0.05;
 type PanelData = {
   id: string;
   position: [number, number, number];
-  rotationY: number;
+  // Quaternion so panels can be oriented for any "up" axis
+  quaternion: [number, number, number, number];
   width: number;
   height: number;
 };
@@ -43,7 +44,7 @@ function Panel({ data, onRemove }: { data: PanelData; onRemove: (id: string) => 
   return (
     <mesh
       position={data.position}
-      rotation={[-Math.PI / 2, 0, data.rotationY]}
+      quaternion={data.quaternion}
       onClick={(e) => {
         e.stopPropagation();
         onRemove(data.id);
@@ -58,6 +59,7 @@ function Panel({ data, onRemove }: { data: PanelData; onRemove: (id: string) => 
         document.body.style.cursor = "auto";
       }}
     >
+      {/* Panel lies flat in local XY plane; thickness along local Z */}
       <boxGeometry args={[data.width, data.height, 0.04]} />
       <meshStandardMaterial
         color={hovered ? "hsl(220, 80%, 35%)" : "hsl(220, 70%, 22%)"}
@@ -118,12 +120,16 @@ function SceneContent({
 }
 
 /**
- * Find the highest "flat horizontal" surface in the model and return
- * a list of panel positions to fill it.
+ * Find the highest "flat" surface in the model — auto-detecting whether the
+ * model is Y-up (standard glTF) or Z-up (Cesium / GIS exports). Returns
+ * a list of panel positions/orientations to fill that surface.
  */
 function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
-  // Collect upward-facing triangles, grouped by their height (Y value).
-  type Tri = { y: number; area: number; centroid: THREE.Vector3 };
+  type Tri = {
+    area: number;
+    centroid: THREE.Vector3;
+    normal: THREE.Vector3;
+  };
   const tris: Tri[] = [];
 
   model.updateMatrixWorld(true);
@@ -142,7 +148,6 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
     const c = new THREE.Vector3();
     const ab = new THREE.Vector3();
     const ac = new THREE.Vector3();
-    const normal = new THREE.Vector3();
 
     for (let i = 0; i < triCount; i++) {
       const i0 = idx ? idx.getX(i * 3) : i * 3;
@@ -155,13 +160,10 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
 
       ab.subVectors(b, a);
       ac.subVectors(c, a);
-      normal.crossVectors(ab, ac);
-      const area = normal.length() * 0.5;
+      const cross = new THREE.Vector3().crossVectors(ab, ac);
+      const area = cross.length() * 0.5;
       if (area < 1e-6) continue;
-      normal.normalize();
-
-      // Mostly horizontal (normal pointing up), within ~15deg
-      if (normal.y < 0.95) continue;
+      const normal = cross.normalize();
 
       const centroid = new THREE.Vector3()
         .add(a)
@@ -169,51 +171,102 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
         .add(c)
         .multiplyScalar(1 / 3);
 
-      tris.push({ y: centroid.y, area, centroid });
+      tris.push({ area, centroid, normal });
     }
   });
 
   if (tris.length === 0) return [];
 
-  // Bucket triangles by height (with tolerance) and pick the highest
-  // bucket that has a meaningful total area.
-  tris.sort((a, b) => b.y - a.y);
+  // --- 1. Auto-detect the "up" axis -----------------------------------
+  // Sum triangle area per axis (using |normal.axis| weighted by area).
+  let areaY = 0;
+  let areaZ = 0;
+  for (const t of tris) {
+    areaY += Math.abs(t.normal.y) * t.area;
+    areaZ += Math.abs(t.normal.z) * t.area;
+  }
+  const upAxis = new THREE.Vector3(0, 1, 0);
+  if (areaZ > areaY) upAxis.set(0, 0, 1);
 
-  const tol = 0.05; // 5cm
+  // --- 2. Keep only triangles whose normal points along +up -----------
+  const flatTris = tris.filter((t) => t.normal.dot(upAxis) > 0.95);
+  if (flatTris.length === 0) return [];
+
+  // height of each tri along the up axis
+  const upHeight = (v: THREE.Vector3) => v.dot(upAxis);
+
+  flatTris.sort((a, b) => upHeight(b.centroid) - upHeight(a.centroid));
+
+  // --- 3. Find highest plane with meaningful area ---------------------
+  const tol = 0.2; // allow some slack for noisy meshes
   let best: Tri[] | null = null;
-  let bestY = 0;
+  let bestH = 0;
 
-  for (let i = 0; i < tris.length; i++) {
-    const refY = tris[i].y;
-    const bucket = tris.filter((t) => Math.abs(t.y - refY) <= tol);
+  for (let i = 0; i < flatTris.length; i++) {
+    const refH = upHeight(flatTris[i].centroid);
+    const bucket = flatTris.filter(
+      (t) => Math.abs(upHeight(t.centroid) - refH) <= tol
+    );
     const totalArea = bucket.reduce((s, t) => s + t.area, 0);
-    if (totalArea > 0.5) {
+    if (totalArea > 1.0) {
       best = bucket;
-      bestY = refY;
+      bestH = refH;
       break;
     }
   }
-
   if (!best) {
-    best = [tris[0]];
-    bestY = tris[0].y;
+    best = [flatTris[0]];
+    bestH = upHeight(flatTris[0].centroid);
   }
 
-  // Compute XZ bounding box of the best surface
-  const minX = Math.min(...best.map((t) => t.centroid.x));
-  const maxX = Math.max(...best.map((t) => t.centroid.x));
-  const minZ = Math.min(...best.map((t) => t.centroid.z));
-  const maxZ = Math.max(...best.map((t) => t.centroid.z));
+  // --- 4. Build a 2D coordinate frame on the flat plane ---------------
+  // Pick two axes orthogonal to upAxis.
+  const axisU = new THREE.Vector3();
+  const axisV = new THREE.Vector3();
+  if (upAxis.y === 1) {
+    axisU.set(1, 0, 0);
+    axisV.set(0, 0, 1);
+  } else {
+    // Z-up
+    axisU.set(1, 0, 0);
+    axisV.set(0, 1, 0);
+  }
 
-  const width = maxX - minX;
-  const depth = maxZ - minZ;
+  // 2D bounds of best surface in (u,v)
+  const us = best.map((t) => t.centroid.dot(axisU));
+  const vs = best.map((t) => t.centroid.dot(axisV));
+  const minU = Math.min(...us);
+  const maxU = Math.max(...us);
+  const minV = Math.min(...vs);
+  const maxV = Math.max(...vs);
+
+  const width = maxU - minU;
+  const depth = maxV - minV;
+
+  // --- 5. Orientation quaternion: align local +Z with up axis ---------
+  const q = new THREE.Quaternion().setFromUnitVectors(
+    new THREE.Vector3(0, 0, 1),
+    upAxis
+  );
+  const quat: [number, number, number, number] = [q.x, q.y, q.z, q.w];
+
+  // helper: convert (u,v,h) -> world position
+  const toWorld = (u: number, v: number, h: number): [number, number, number] => {
+    const p = new THREE.Vector3()
+      .addScaledVector(axisU, u)
+      .addScaledVector(axisV, v)
+      .addScaledVector(upAxis, h);
+    return [p.x, p.y, p.z];
+  };
+
+  const lift = 0.05; // small offset above surface
+
   if (width < PANEL_W || depth < PANEL_H) {
-    // Surface is too small for a typical panel; place a single small one
     return [
       {
         id: crypto.randomUUID(),
-        position: [(minX + maxX) / 2, bestY + 0.025, (minZ + maxZ) / 2],
-        rotationY: 0,
+        position: toWorld((minU + maxU) / 2, (minV + maxV) / 2, bestH + lift),
+        quaternion: quat,
         width: Math.max(0.3, width * 0.8),
         height: Math.max(0.3, depth * 0.8),
       },
@@ -225,20 +278,20 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
 
   const totalW = cols * PANEL_W + (cols - 1) * PANEL_GAP;
   const totalD = rows * PANEL_H + (rows - 1) * PANEL_GAP;
-  const startX = (minX + maxX) / 2 - totalW / 2 + PANEL_W / 2;
-  const startZ = (minZ + maxZ) / 2 - totalD / 2 + PANEL_H / 2;
+  const startU = (minU + maxU) / 2 - totalW / 2 + PANEL_W / 2;
+  const startV = (minV + maxV) / 2 - totalD / 2 + PANEL_H / 2;
 
   const panels: PanelData[] = [];
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       panels.push({
         id: crypto.randomUUID(),
-        position: [
-          startX + c * (PANEL_W + PANEL_GAP),
-          bestY + 0.025,
-          startZ + r * (PANEL_H + PANEL_GAP),
-        ],
-        rotationY: 0,
+        position: toWorld(
+          startU + c * (PANEL_W + PANEL_GAP),
+          startV + r * (PANEL_H + PANEL_GAP),
+          bestH + lift
+        ),
+        quaternion: quat,
         width: PANEL_W,
         height: PANEL_H,
       });
