@@ -3,6 +3,17 @@ import { Canvas, useThree } from "@react-three/fiber";
 import { OrbitControls, Grid, Environment } from "@react-three/drei";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
+import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
+
+// Shared loader with Draco + Meshopt support (handles compressed .glb files)
+const dracoLoader = new DRACOLoader();
+dracoLoader.setDecoderPath("https://www.gstatic.com/draco/versioned/decoders/1.5.7/");
+dracoLoader.setDecoderConfig({ type: "js" });
+
+const gltfLoader = new GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
+gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3 } from "lucide-react";
@@ -251,7 +262,7 @@ export default function SolarViewer() {
     setPanels([]);
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const loader = new GLTFLoader();
+      const loader = gltfLoader;
       const gltf = await loader.parseAsync(arrayBuffer, "");
       gltf.scene.traverse((o) => {
         const m = o as THREE.Mesh;
