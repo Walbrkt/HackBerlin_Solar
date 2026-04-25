@@ -16,7 +16,15 @@ gltfLoader.setDRACOLoader(dracoLoader);
 gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3 } from "lucide-react";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3, Sparkles, MousePointerClick } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 // Cost per panel in euros (typical residential panel ~ €250)
@@ -35,11 +43,29 @@ type PanelData = {
   height: number;
 };
 
+// A candidate flat surface with a precomputed grid of potential panel slots.
+type Candidate = {
+  id: string;
+  quaternion: [number, number, number, number];
+  // Centers + sizes for every slot in this candidate's grid
+  slots: PanelData[];
+  // Outline corners for the holographic overlay (4 world-space points)
+  outline: [number, number, number][];
+  // Plane height (for sorting)
+  height: number;
+};
+
 function ModelMesh({ object }: { object: THREE.Object3D }) {
   return <primitive object={object} />;
 }
 
-function Panel({ data, onRemove }: { data: PanelData; onRemove: (id: string) => void }) {
+function Panel({
+  data,
+  onRemove,
+}: {
+  data: PanelData;
+  onRemove: (id: string) => void;
+}) {
   const [hovered, setHovered] = useState(false);
   return (
     <mesh
@@ -59,14 +85,91 @@ function Panel({ data, onRemove }: { data: PanelData; onRemove: (id: string) => 
         document.body.style.cursor = "auto";
       }}
     >
-      {/* Panel lies flat in local XY plane; thickness along local Z */}
-      <boxGeometry args={[data.width, data.height, 0.04]} />
+      <boxGeometry args={[data.width, data.height, 0.06]} />
       <meshStandardMaterial
-        color={hovered ? "hsl(220, 80%, 35%)" : "hsl(220, 70%, 22%)"}
-        metalness={0.6}
-        roughness={0.25}
-        emissive={hovered ? "hsl(220, 90%, 40%)" : "hsl(220, 60%, 10%)"}
-        emissiveIntensity={hovered ? 0.4 : 0.1}
+        color={hovered ? "hsl(140, 100%, 65%)" : "hsl(140, 100%, 50%)"}
+        metalness={0.3}
+        roughness={0.4}
+        emissive="hsl(140, 100%, 45%)"
+        emissiveIntensity={hovered ? 0.9 : 0.55}
+      />
+    </mesh>
+  );
+}
+
+// Holographic outline (semi-transparent glowing plane) for a candidate area
+function HoloArea({ candidate }: { candidate: Candidate }) {
+  // Compute centroid + dimensions from the slot bounds
+  const { center, w, h } = useMemo(() => {
+    const xs = candidate.slots.map((s) => s.position[0]);
+    const ys = candidate.slots.map((s) => s.position[1]);
+    const zs = candidate.slots.map((s) => s.position[2]);
+    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
+    const cz = (Math.min(...zs) + Math.max(...zs)) / 2;
+    // Use outline points to compute size
+    const o = candidate.outline;
+    const dU = new THREE.Vector3(...o[1]).sub(new THREE.Vector3(...o[0])).length();
+    const dV = new THREE.Vector3(...o[3]).sub(new THREE.Vector3(...o[0])).length();
+    return { center: [cx, cy, cz] as [number, number, number], w: dU, h: dV };
+  }, [candidate]);
+
+  return (
+    <mesh position={center} quaternion={candidate.quaternion}>
+      <planeGeometry args={[w, h]} />
+      <meshBasicMaterial
+        color="hsl(180, 100%, 60%)"
+        transparent
+        opacity={0.35}
+        side={THREE.DoubleSide}
+        depthWrite={false}
+      />
+    </mesh>
+  );
+}
+
+// Selectable slot used in "pick your own" mode
+function SlotPicker({
+  slot,
+  selected,
+  onToggle,
+}: {
+  slot: PanelData;
+  selected: boolean;
+  onToggle: (id: string) => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const color = selected
+    ? "hsl(140, 100%, 50%)"
+    : hovered
+      ? "hsl(180, 100%, 70%)"
+      : "hsl(180, 100%, 55%)";
+  return (
+    <mesh
+      position={slot.position}
+      quaternion={slot.quaternion}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle(slot.id);
+      }}
+      onPointerOver={(e) => {
+        e.stopPropagation();
+        setHovered(true);
+        document.body.style.cursor = "pointer";
+      }}
+      onPointerOut={() => {
+        setHovered(false);
+        document.body.style.cursor = "auto";
+      }}
+    >
+      <boxGeometry args={[slot.width, slot.height, selected ? 0.06 : 0.02]} />
+      <meshStandardMaterial
+        color={color}
+        transparent
+        opacity={selected ? 1 : 0.55}
+        emissive={color}
+        emissiveIntensity={selected ? 0.7 : 0.3}
+        depthWrite={selected}
       />
     </mesh>
   );
@@ -76,10 +179,18 @@ function SceneContent({
   model,
   panels,
   onRemovePanel,
+  highlights,
+  pickingSlots,
+  selectedSlots,
+  onToggleSlot,
 }: {
   model: THREE.Object3D | null;
   panels: PanelData[];
   onRemovePanel: (id: string) => void;
+  highlights: Candidate[];
+  pickingSlots: PanelData[] | null;
+  selectedSlots: Set<string>;
+  onToggleSlot: (id: string) => void;
 }) {
   const { camera } = useThree();
 
@@ -105,6 +216,17 @@ function SceneContent({
       {panels.map((p) => (
         <Panel key={p.id} data={p} onRemove={onRemovePanel} />
       ))}
+      {highlights.map((c) => (
+        <HoloArea key={c.id} candidate={c} />
+      ))}
+      {pickingSlots?.map((s) => (
+        <SlotPicker
+          key={s.id}
+          slot={s}
+          selected={selectedSlots.has(s.id)}
+          onToggle={onToggleSlot}
+        />
+      ))}
       {!model && (
         <Grid
           args={[20, 20]}
@@ -120,11 +242,10 @@ function SceneContent({
 }
 
 /**
- * Find the highest "flat" surface in the model — auto-detecting whether the
- * model is Y-up (standard glTF) or Z-up (Cesium / GIS exports). Returns
- * a list of panel positions/orientations to fill that surface.
+ * Find ALL meaningful flat horizontal surfaces in the model.
+ * Returns one Candidate per surface, each with its own grid of slots.
  */
-function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
+function findCandidateSurfaces(model: THREE.Object3D): Candidate[] {
   type Tri = {
     area: number;
     centroid: THREE.Vector3;
@@ -177,8 +298,7 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
 
   if (tris.length === 0) return [];
 
-  // --- 1. Auto-detect the "up" axis -----------------------------------
-  // Sum triangle area per axis (using |normal.axis| weighted by area).
+  // Detect up axis
   let areaY = 0;
   let areaZ = 0;
   for (const t of tris) {
@@ -188,69 +308,43 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
   const upAxis = new THREE.Vector3(0, 1, 0);
   if (areaZ > areaY) upAxis.set(0, 0, 1);
 
-  // --- 2. Keep only triangles whose normal points along +up -----------
   const flatTris = tris.filter((t) => t.normal.dot(upAxis) > 0.95);
   if (flatTris.length === 0) return [];
 
-  // height of each tri along the up axis
   const upHeight = (v: THREE.Vector3) => v.dot(upAxis);
 
-  flatTris.sort((a, b) => upHeight(b.centroid) - upHeight(a.centroid));
-
-  // --- 3. Find highest plane with meaningful area ---------------------
-  const tol = 0.2; // allow some slack for noisy meshes
-  let best: Tri[] | null = null;
-  let bestH = 0;
-
-  for (let i = 0; i < flatTris.length; i++) {
-    const refH = upHeight(flatTris[i].centroid);
-    const bucket = flatTris.filter(
-      (t) => Math.abs(upHeight(t.centroid) - refH) <= tol
+  // Cluster flat tris by height (greedy buckets)
+  const sorted = [...flatTris].sort(
+    (a, b) => upHeight(b.centroid) - upHeight(a.centroid)
+  );
+  const tol = 0.25;
+  const clusters: Tri[][] = [];
+  for (const t of sorted) {
+    const h = upHeight(t.centroid);
+    const c = clusters.find(
+      (cl) => Math.abs(upHeight(cl[0].centroid) - h) <= tol
     );
-    const totalArea = bucket.reduce((s, t) => s + t.area, 0);
-    if (totalArea > 1.0) {
-      best = bucket;
-      bestH = refH;
-      break;
-    }
-  }
-  if (!best) {
-    best = [flatTris[0]];
-    bestH = upHeight(flatTris[0].centroid);
+    if (c) c.push(t);
+    else clusters.push([t]);
   }
 
-  // --- 4. Build a 2D coordinate frame on the flat plane ---------------
-  // Pick two axes orthogonal to upAxis.
+  // Build coordinate frame
   const axisU = new THREE.Vector3();
   const axisV = new THREE.Vector3();
   if (upAxis.y === 1) {
     axisU.set(1, 0, 0);
     axisV.set(0, 0, 1);
   } else {
-    // Z-up
     axisU.set(1, 0, 0);
     axisV.set(0, 1, 0);
   }
 
-  // 2D bounds of best surface in (u,v)
-  const us = best.map((t) => t.centroid.dot(axisU));
-  const vs = best.map((t) => t.centroid.dot(axisV));
-  const minU = Math.min(...us);
-  const maxU = Math.max(...us);
-  const minV = Math.min(...vs);
-  const maxV = Math.max(...vs);
-
-  const width = maxU - minU;
-  const depth = maxV - minV;
-
-  // --- 5. Orientation quaternion: align local +Z with up axis ---------
   const q = new THREE.Quaternion().setFromUnitVectors(
     new THREE.Vector3(0, 0, 1),
     upAxis
   );
   const quat: [number, number, number, number] = [q.x, q.y, q.z, q.w];
 
-  // helper: convert (u,v,h) -> world position
   const toWorld = (u: number, v: number, h: number): [number, number, number] => {
     const p = new THREE.Vector3()
       .addScaledVector(axisU, u)
@@ -259,46 +353,76 @@ function generatePanelsForModel(model: THREE.Object3D): PanelData[] {
     return [p.x, p.y, p.z];
   };
 
-  const lift = 0.05; // small offset above surface
+  const lift = 0.08;
+  const candidates: Candidate[] = [];
 
-  if (width < PANEL_W || depth < PANEL_H) {
-    return [
-      {
-        id: crypto.randomUUID(),
-        position: toWorld((minU + maxU) / 2, (minV + maxV) / 2, bestH + lift),
-        quaternion: quat,
-        width: Math.max(0.3, width * 0.8),
-        height: Math.max(0.3, depth * 0.8),
-      },
-    ];
-  }
+  for (const cluster of clusters) {
+    const totalArea = cluster.reduce((s, t) => s + t.area, 0);
+    if (totalArea < 2.0) continue; // ignore tiny patches
 
-  const cols = Math.floor((width + PANEL_GAP) / (PANEL_W + PANEL_GAP));
-  const rows = Math.floor((depth + PANEL_GAP) / (PANEL_H + PANEL_GAP));
+    const refH = upHeight(cluster[0].centroid);
+    const us = cluster.map((t) => t.centroid.dot(axisU));
+    const vs = cluster.map((t) => t.centroid.dot(axisV));
+    const minU = Math.min(...us);
+    const maxU = Math.max(...us);
+    const minV = Math.min(...vs);
+    const maxV = Math.max(...vs);
+    const width = maxU - minU;
+    const depth = maxV - minV;
+    if (width < PANEL_W || depth < PANEL_H) continue;
 
-  const totalW = cols * PANEL_W + (cols - 1) * PANEL_GAP;
-  const totalD = rows * PANEL_H + (rows - 1) * PANEL_GAP;
-  const startU = (minU + maxU) / 2 - totalW / 2 + PANEL_W / 2;
-  const startV = (minV + maxV) / 2 - totalD / 2 + PANEL_H / 2;
+    const cols = Math.floor((width + PANEL_GAP) / (PANEL_W + PANEL_GAP));
+    const rows = Math.floor((depth + PANEL_GAP) / (PANEL_H + PANEL_GAP));
+    if (cols < 1 || rows < 1) continue;
 
-  const panels: PanelData[] = [];
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      panels.push({
-        id: crypto.randomUUID(),
-        position: toWorld(
-          startU + c * (PANEL_W + PANEL_GAP),
-          startV + r * (PANEL_H + PANEL_GAP),
-          bestH + lift
-        ),
-        quaternion: quat,
-        width: PANEL_W,
-        height: PANEL_H,
-      });
+    const totalW = cols * PANEL_W + (cols - 1) * PANEL_GAP;
+    const totalD = rows * PANEL_H + (rows - 1) * PANEL_GAP;
+    const startU = (minU + maxU) / 2 - totalW / 2 + PANEL_W / 2;
+    const startV = (minV + maxV) / 2 - totalD / 2 + PANEL_H / 2;
+
+    const slots: PanelData[] = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        slots.push({
+          id: crypto.randomUUID(),
+          position: toWorld(
+            startU + c * (PANEL_W + PANEL_GAP),
+            startV + r * (PANEL_H + PANEL_GAP),
+            refH + lift
+          ),
+          quaternion: quat,
+          width: PANEL_W,
+          height: PANEL_H,
+        });
+      }
     }
+
+    const u0 = (minU + maxU) / 2 - totalW / 2;
+    const u1 = (minU + maxU) / 2 + totalW / 2;
+    const v0 = (minV + maxV) / 2 - totalD / 2;
+    const v1 = (minV + maxV) / 2 + totalD / 2;
+    const outline: [number, number, number][] = [
+      toWorld(u0, v0, refH + lift * 0.5),
+      toWorld(u1, v0, refH + lift * 0.5),
+      toWorld(u1, v1, refH + lift * 0.5),
+      toWorld(u0, v1, refH + lift * 0.5),
+    ];
+
+    candidates.push({
+      id: crypto.randomUUID(),
+      quaternion: quat,
+      slots,
+      outline,
+      height: refH,
+    });
   }
-  return panels;
+
+  // Sort highest first
+  candidates.sort((a, b) => b.height - a.height);
+  return candidates;
 }
+
+type PlacementMode = null | "choose" | "picking";
 
 export default function SolarViewer() {
   const [model, setModel] = useState<THREE.Object3D | null>(null);
@@ -307,16 +431,23 @@ export default function SolarViewer() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
+  const [highlights, setHighlights] = useState<Candidate[]>([]);
+  const [showHighlights, setShowHighlights] = useState(false);
+  const [placementMode, setPlacementMode] = useState<PlacementMode>(null);
+  const [selectedSlots, setSelectedSlots] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const loadGlb = useCallback(async (file: File) => {
     setLoading(true);
     setError(null);
     setPanels([]);
+    setHighlights([]);
+    setShowHighlights(false);
+    setPlacementMode(null);
+    setSelectedSlots(new Set());
     try {
       const arrayBuffer = await file.arrayBuffer();
-      const loader = gltfLoader;
-      const gltf = await loader.parseAsync(arrayBuffer, "");
+      const gltf = await gltfLoader.parseAsync(arrayBuffer, "");
       gltf.scene.traverse((o) => {
         const m = o as THREE.Mesh;
         if (m.isMesh) {
@@ -356,16 +487,71 @@ export default function SolarViewer() {
     [handleFiles]
   );
 
-  const placePanels = useCallback(() => {
+  // Compute candidates lazily
+  const ensureCandidates = useCallback((): Candidate[] => {
+    if (!model) return [];
+    if (highlights.length > 0) return highlights;
+    const found = findCandidateSurfaces(model);
+    setHighlights(found);
+    return found;
+  }, [model, highlights]);
+
+  const toggleHighlights = useCallback(() => {
     if (!model) return;
-    const newPanels = generatePanelsForModel(model);
-    if (newPanels.length === 0) {
-      setError("No flat horizontal surface detected on this model.");
+    const found = ensureCandidates();
+    if (found.length === 0) {
+      setError("No flat horizontal surfaces detected on this model.");
       return;
     }
     setError(null);
-    setPanels(newPanels);
-  }, [model]);
+    setShowHighlights((v) => !v);
+  }, [model, ensureCandidates]);
+
+  const openPlacement = useCallback(() => {
+    if (!model) return;
+    const found = ensureCandidates();
+    if (found.length === 0) {
+      setError("No flat horizontal surfaces detected on this model.");
+      return;
+    }
+    setError(null);
+    setPlacementMode("choose");
+  }, [model, ensureCandidates]);
+
+  const placeRecommended = useCallback(() => {
+    const all = highlights.flatMap((c) => c.slots);
+    setPanels(all.map((s) => ({ ...s, id: crypto.randomUUID() })));
+    setPlacementMode(null);
+    setShowHighlights(false);
+  }, [highlights]);
+
+  const startPicking = useCallback(() => {
+    setSelectedSlots(new Set());
+    setPlacementMode("picking");
+    setShowHighlights(false);
+  }, []);
+
+  const toggleSlot = useCallback((id: string) => {
+    setSelectedSlots((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const confirmPicked = useCallback(() => {
+    const all = highlights.flatMap((c) => c.slots);
+    const chosen = all.filter((s) => selectedSlots.has(s.id));
+    setPanels(chosen.map((s) => ({ ...s, id: crypto.randomUUID() })));
+    setPlacementMode(null);
+    setSelectedSlots(new Set());
+  }, [highlights, selectedSlots]);
+
+  const cancelPicking = useCallback(() => {
+    setPlacementMode(null);
+    setSelectedSlots(new Set());
+  }, []);
 
   const removePanel = useCallback((id: string) => {
     setPanels((prev) => prev.filter((p) => p.id !== id));
@@ -377,10 +563,14 @@ export default function SolarViewer() {
     const area = panels.reduce((s, p) => s + p.width * p.height, 0);
     return {
       count: panels.length,
-      area: area,
+      area,
       cost: panels.length * COST_PER_PANEL,
     };
   }, [panels]);
+
+  const pickingSlots = placementMode === "picking"
+    ? highlights.flatMap((c) => c.slots)
+    : null;
 
   return (
     <div className="flex h-screen w-full bg-background text-foreground">
@@ -400,7 +590,15 @@ export default function SolarViewer() {
           className="!absolute inset-0"
         >
           <Suspense fallback={null}>
-            <SceneContent model={model} panels={panels} onRemovePanel={removePanel} />
+            <SceneContent
+              model={model}
+              panels={panels}
+              onRemovePanel={removePanel}
+              highlights={showHighlights ? highlights : []}
+              pickingSlots={pickingSlots}
+              selectedSlots={selectedSlots}
+              onToggleSlot={toggleSlot}
+            />
           </Suspense>
         </Canvas>
 
@@ -443,6 +641,22 @@ export default function SolarViewer() {
           </div>
         )}
 
+        {/* Picking mode toolbar */}
+        {placementMode === "picking" && (
+          <div className="absolute bottom-6 left-1/2 flex -translate-x-1/2 items-center gap-3 rounded-lg border border-border bg-card/95 px-4 py-3 shadow-lg backdrop-blur">
+            <span className="text-sm">
+              <span className="font-semibold text-primary">{selectedSlots.size}</span>{" "}
+              slot{selectedSlots.size === 1 ? "" : "s"} selected
+            </span>
+            <Button size="sm" variant="ghost" onClick={cancelPicking}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={confirmPicked} disabled={selectedSlots.size === 0}>
+              Confirm placement
+            </Button>
+          </div>
+        )}
+
         {error && (
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-md bg-destructive px-4 py-2 text-sm text-destructive-foreground shadow">
             {error}
@@ -464,9 +678,18 @@ export default function SolarViewer() {
 
         <div className="space-y-3 p-5">
           <Button
+            variant="outline"
             className="w-full"
-            onClick={placePanels}
+            onClick={toggleHighlights}
             disabled={!model || loading}
+          >
+            <Sparkles className="mr-2 h-4 w-4" />
+            {showHighlights ? "Hide possible areas" : "Highlight possible areas"}
+          </Button>
+          <Button
+            className="w-full"
+            onClick={openPlacement}
+            disabled={!model || loading || placementMode === "picking"}
           >
             <Sun className="mr-2 h-4 w-4" />
             Place Solar Panels
@@ -508,10 +731,56 @@ export default function SolarViewer() {
 
         <div className="mt-auto border-t border-border p-5 text-xs text-muted-foreground">
           <p className="mb-1 font-medium text-foreground">Tip</p>
-          Click any blue panel in the 3D view to remove it. Drag, scroll, and
-          right-click drag in the viewer to orbit, zoom, and pan.
+          Click any green panel in the 3D view to remove it. Use "Highlight
+          possible areas" to preview where panels can go.
         </div>
       </aside>
+
+      {/* Placement mode chooser */}
+      <Dialog
+        open={placementMode === "choose"}
+        onOpenChange={(o) => !o && setPlacementMode(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Place Solar Panels</DialogTitle>
+            <DialogDescription>
+              Choose how you want to lay out panels on the detected surfaces.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              onClick={placeRecommended}
+              className="flex flex-col items-start gap-2 rounded-lg border border-border bg-background/50 p-4 text-left transition-colors hover:border-primary hover:bg-primary/5"
+            >
+              <Sparkles className="h-5 w-5 text-primary" />
+              <div className="font-semibold">Use recommended</div>
+              <div className="text-xs text-muted-foreground">
+                Auto-fill every detected flat surface with a full grid of panels.
+              </div>
+              <div className="mt-1 text-xs text-primary">
+                {highlights.reduce((s, c) => s + c.slots.length, 0)} panels across{" "}
+                {highlights.length} surface{highlights.length === 1 ? "" : "s"}
+              </div>
+            </button>
+            <button
+              onClick={startPicking}
+              className="flex flex-col items-start gap-2 rounded-lg border border-border bg-background/50 p-4 text-left transition-colors hover:border-primary hover:bg-primary/5"
+            >
+              <MousePointerClick className="h-5 w-5 text-primary" />
+              <div className="font-semibold">Pick your own</div>
+              <div className="text-xs text-muted-foreground">
+                Click individual grid slots in the 3D view, then confirm to place.
+              </div>
+            </button>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setPlacementMode(null)}>
+              Cancel
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
