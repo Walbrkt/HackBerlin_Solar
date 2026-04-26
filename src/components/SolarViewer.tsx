@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useRef, useState, Suspense, useEffect } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { OrbitControls, Grid, Environment } from "@react-three/drei";
+import { OrbitControls, Grid, Environment, useGLTF } from "@react-three/drei";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
@@ -40,6 +40,9 @@ const PRICE_PER_PANEL = 1500;
 const PRICE_PER_KWH_BATTERY = 800;
 // Local "out" axis of the BoxGeometry-based panel preview (Z is the thin axis).
 const PANEL_LOCAL_NORMAL = new THREE.Vector3(0, 0, 1);
+
+const FLAT_PANEL_URL = "/solar_panels/solar_panel_flat.glb";
+useGLTF.preload(FLAT_PANEL_URL);
 
 const COST_PER_PANEL = 250;
 const PANEL_W = 1.0;
@@ -156,7 +159,44 @@ function Panel({
   const dragPlaneRef = useRef(new THREE.Plane());
   const dragOffsetRef = useRef(new THREE.Vector3());
   const intersectionRef = useRef(new THREE.Vector3());
-  const boxThickness = data.depth ?? (hovered ? 0.42 : 0.28);
+
+  const { scene } = useGLTF(FLAT_PANEL_URL);
+
+  const [clonedScene, panelScale] = useMemo(() => {
+    const clone = scene.clone(true);
+    clone.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (mesh.isMesh) {
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.material = Array.isArray(mesh.material)
+          ? mesh.material.map((m) => m.clone())
+          : (mesh.material as THREE.Material).clone();
+      }
+    });
+    const box = new THREE.Box3().setFromObject(clone);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    clone.position.sub(center);
+    const sx = size.x > 0 ? data.width / size.x : 1;
+    const sy = size.y > 0 ? data.height / size.y : 1;
+    return [clone, [sx, sy, sx] as [number, number, number]];
+  }, [scene, data.width, data.height]);
+
+  useEffect(() => {
+    clonedScene.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mats.forEach((m) => {
+        const mat = m as THREE.MeshStandardMaterial;
+        if (mat.emissive) {
+          mat.emissive.setScalar(hovered ? 0.12 : 0);
+          mat.emissiveIntensity = hovered ? 1.0 : 0;
+        }
+      });
+    });
+  }, [hovered, clonedScene]);
 
   const startHolding = useCallback((e: any) => {
     e.stopPropagation();
@@ -194,11 +234,10 @@ function Panel({
   }, [hovered, onHoldingChange]);
 
   return (
-    <mesh
+    <group
       position={data.position}
       quaternion={data.quaternion}
-      castShadow
-      receiveShadow
+      scale={panelScale}
       onPointerDown={startHolding}
       onPointerUp={(e) => stopHolding(e)}
       onPointerCancel={(e) => stopHolding(e)}
@@ -223,17 +262,8 @@ function Panel({
         document.body.style.cursor = dragging ? "grabbing" : "grab";
       }}
     >
-      <boxGeometry args={[data.width, data.height, boxThickness]} />
-      <meshStandardMaterial
-        color={hovered ? "hsl(0, 0%, 12%)" : "hsl(0, 0%, 3%)"}
-        transparent={false}
-        opacity={1}
-        metalness={0.05}
-        roughness={0.9}
-        emissive="hsl(0, 0%, 22%)"
-        emissiveIntensity={hovered ? 0.8 : 0.55}
-      />
-    </mesh>
+      <primitive object={clonedScene} />
+    </group>
   );
 }
 
@@ -591,6 +621,7 @@ function SceneContent({
   panels,
   onRemovePanel,
   onMovePanel,
+  onRotatePanel,
   highlights,
   pickingSlots,
   selectedSlots,
@@ -612,6 +643,7 @@ function SceneContent({
   panels: PanelData[];
   onRemovePanel: (id: string) => void;
   onMovePanel: (id: string, position: [number, number, number]) => void;
+  onRotatePanel: (id: string, quaternion: [number, number, number, number]) => void;
   highlights: Candidate[];
   pickingSlots: PanelData[] | null;
   selectedSlots: Set<string>;
@@ -676,6 +708,14 @@ function SceneContent({
         ]);
       }
 
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        const angle = THREE.MathUtils.degToRad(event.key === "ArrowLeft" ? 15 : -15);
+        const q = new THREE.Quaternion(...active.quaternion);
+        q.premultiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), angle));
+        onRotatePanel(heldPanelId, [q.x, q.y, q.z, q.w]);
+      }
+
       if (event.key === "Backspace") {
         event.preventDefault();
         onRemovePanel(heldPanelId);
@@ -685,7 +725,7 @@ function SceneContent({
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [heldPanelId, onMovePanel, onRemovePanel, panels]);
+  }, [heldPanelId, onMovePanel, onRotatePanel, onRemovePanel, panels]);
 
   return (
     <>
@@ -1068,6 +1108,10 @@ export default function SolarViewer() {
     setPanels((prev) => prev.map((panel) => (panel.id === id ? { ...panel, position } : panel)));
   }, []);
 
+  const rotatePanel = useCallback((id: string, quaternion: [number, number, number, number]) => {
+    setPanels((prev) => prev.map((panel) => (panel.id === id ? { ...panel, quaternion } : panel)));
+  }, []);
+
   const clearPanels = useCallback(() => {
     setPanels([]);
     setHighlights([]);
@@ -1116,6 +1160,7 @@ export default function SolarViewer() {
               panels={panels}
               onRemovePanel={removePanel}
               onMovePanel={movePanel}
+              onRotatePanel={rotatePanel}
               highlights={showHighlights ? highlights : []}
               pickingSlots={pickingSlots}
               selectedSlots={selectedSlots}
