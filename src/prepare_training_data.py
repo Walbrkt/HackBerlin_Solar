@@ -254,8 +254,10 @@ def merge_features_and_targets(df_features: pd.DataFrame, df_targets: pd.DataFra
     
     logger.info(f"  After inner join: {len(df_merged)} projects (complete pairs)")
     
-    # Check for alignment
-    assert len(df_merged) > 0, "No projects matched between features and targets!"
+    # Check for alignment. Use raise (not assert) so the check still runs
+    # under `python -O` and survives bytecode optimization.
+    if len(df_merged) == 0:
+        raise ValueError("No projects matched between features and targets!")
     
     n_feat_only = len(df_features) - len(df_merged)
     n_targ_only = len(df_targets) - len(df_merged)
@@ -282,33 +284,40 @@ def validate_training_data(df: pd.DataFrame) -> None:
         df: Merged training dataframe
         
     Raises:
-        AssertionError: If validation fails
+        ValueError: If validation fails.
     """
     logger.info("Validating training data...")
-    
+
     # Check uniqueness
-    assert df['project_id'].nunique() == len(df), "Duplicate project_ids in training data!"
+    if df['project_id'].nunique() != len(df):
+        raise ValueError("Duplicate project_ids in training data!")
     logger.info(f"  ✓ All project_ids are unique")
-    
+
     # Check critical columns for missing values (the ones we explicitly imputed + targets)
     critical_cols = ['energy_demand_wh', 'house_size_sqm', 'heating_existing_electricity_demand_kwh',
                      'has_ev', 'has_solar', 'has_storage', 'has_wallbox',
                      'total_estimated_demand_kwh',
                      'total_pv_kwp', 'total_inverter_kw', 'total_battery_kwh']
-    
+
     missing_critical = df[critical_cols].isna().sum()
-    assert missing_critical.sum() == 0, f"Critical columns have missing values:\n{missing_critical[missing_critical > 0]}"
+    if missing_critical.sum() != 0:
+        raise ValueError(
+            "Critical columns have missing values:\n"
+            f"{missing_critical[missing_critical > 0]}"
+        )
     logger.info(f"  ✓ All critical features and targets have no missing values")
-    
+
     # Check demand is positive
     demand_col = 'total_estimated_demand_kwh'
-    assert (df[demand_col] >= 0).all(), "Negative demand values detected!"
+    if not (df[demand_col] >= 0).all():
+        raise ValueError("Negative demand values detected!")
     logger.info(f"  ✓ All demand values are non-negative")
-    
+
     # Check targets are non-negative
     target_cols = ['total_pv_kwp', 'total_inverter_kw', 'total_battery_kwh']
     for col in target_cols:
-        assert (df[col] >= 0).all(), f"Negative values in {col}!"
+        if not (df[col] >= 0).all():
+            raise ValueError(f"Negative values in {col}!")
     logger.info(f"  ✓ All target values are non-negative")
     
     # Log any remaining missing values (informational)

@@ -178,10 +178,13 @@ def filter_maximum_pv_option(df: pd.DataFrame) -> pd.DataFrame:
     idx = df.groupby('project_id')['total_pv_kwp'].idxmax()
     df_max = df.loc[idx].reset_index(drop=True)
     
-    # Verify we have one row per project
+    # Verify we have one row per project. Use raise (not assert) so the check
+    # still runs under `python -O` and survives bytecode optimization.
     n_projects = len(df['project_id'].unique())
-    assert len(df_max) == n_projects, \
-        f"Expected {n_projects} rows after filtering max options, got {len(df_max)}"
+    if len(df_max) != n_projects:
+        raise ValueError(
+            f"Expected {n_projects} rows after filtering max options, got {len(df_max)}"
+        )
     
     logger.info(f"Filtered to {len(df_max)} projects (max PV option per project)")
     
@@ -208,28 +211,32 @@ def validate_output(df: pd.DataFrame) -> None:
         df: Output DataFrame
         
     Raises:
-        AssertionError: If validation fails
+        ValueError: If validation fails.
     """
     n_rows = len(df)
     n_unique_projects = len(df['project_id'].unique())
-    
-    assert n_rows == n_unique_projects, \
-        f"Expected {n_unique_projects} unique projects, got {n_rows} rows"
-    
+
+    if n_rows != n_unique_projects:
+        raise ValueError(
+            f"Expected {n_unique_projects} unique projects, got {n_rows} rows"
+        )
+
     metric_cols = ['total_pv_kwp', 'total_inverter_kw', 'total_battery_kwh']
-    
+
     for col in metric_cols:
         missing = df[col].isna().sum()
-        assert missing == 0, f"Column '{col}' has {missing} missing values"
-        
+        if missing != 0:
+            raise ValueError(f"Column '{col}' has {missing} missing values")
+
         # Warnings for zero or very small values (may indicate data quality issues)
         zero_count = (df[col] == 0).sum()
         if zero_count > 0:
             logger.warning(f"Column '{col}' has {zero_count} zero values")
-        
+
         # Check for negative values
         negative = (df[col] < 0).sum()
-        assert negative == 0, f"Column '{col}' has {negative} negative values"
+        if negative != 0:
+            raise ValueError(f"Column '{col}' has {negative} negative values")
     
     logger.info("Validation passed: clean output with one row per project")
 
