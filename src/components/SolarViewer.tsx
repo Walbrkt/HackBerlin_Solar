@@ -189,6 +189,38 @@ type Candidate = {
   height: number;
 };
 
+// --- 2-D OBB collision (SAT) ---
+// Extract Z-axis rotation angle from a unit quaternion.
+function zAngleFromQ(q: [number, number, number, number]): number {
+  const [qx, qy, qz, qw] = q;
+  return Math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz));
+}
+
+// Project an OBB (centre cx,cy; half-extents hw,hh; rotation angle) onto axis (tx,ty).
+function satInterval(cx: number, cy: number, hw: number, hh: number, angle: number, tx: number, ty: number): [number, number] {
+  const cos = Math.cos(angle), sin = Math.sin(angle);
+  const extent = hw * Math.abs(cos * tx + sin * ty) + hh * Math.abs(-sin * tx + cos * ty);
+  const center = cx * tx + cy * ty;
+  return [center - extent, center + extent];
+}
+
+function panelsOverlap(a: PanelData, b: PanelData): boolean {
+  const angleA = zAngleFromQ(a.quaternion);
+  const angleB = zAngleFromQ(b.quaternion);
+  const axes: [number, number][] = [
+    [Math.cos(angleA), Math.sin(angleA)],
+    [-Math.sin(angleA), Math.cos(angleA)],
+    [Math.cos(angleB), Math.sin(angleB)],
+    [-Math.sin(angleB), Math.cos(angleB)],
+  ];
+  for (const [tx, ty] of axes) {
+    const iA = satInterval(a.position[0], a.position[1], a.width / 2, a.height / 2, angleA, tx, ty);
+    const iB = satInterval(b.position[0], b.position[1], b.width / 2, b.height / 2, angleB, tx, ty);
+    if (iA[1] - iB[0] < 1e-4 || iB[1] - iA[0] < 1e-4) return false;
+  }
+  return true;
+}
+
 type SnapPose = {
   position: [number, number, number];
   quaternion: [number, number, number, number];
@@ -266,12 +298,16 @@ function PreviewPanel({ pose }: { pose: SnapPose }) {
 
 function Panel({
   data,
+  selected,
   onMove,
   onHoldingChange,
+  onToggleSelect,
 }: {
   data: PanelData;
+  selected: boolean;
   onMove: (id: string, position: [number, number, number]) => void;
   onHoldingChange: (id: string | null) => void;
+  onToggleSelect: (id: string) => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -309,16 +345,27 @@ function Panel({
       const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
       mats.forEach((m) => {
         const mat = m as THREE.MeshStandardMaterial;
-        if (mat.emissive) {
-          mat.emissive.setScalar(hovered ? 0.12 : 0);
-          mat.emissiveIntensity = hovered ? 1.0 : 0;
+        if (!mat.emissive) return;
+        if (selected) {
+          mat.emissive.set(0.05, 0.25, 0.7);
+          mat.emissiveIntensity = 0.9;
+        } else if (hovered) {
+          mat.emissive.setScalar(0.12);
+          mat.emissiveIntensity = 1.0;
+        } else {
+          mat.emissive.setScalar(0);
+          mat.emissiveIntensity = 0;
         }
       });
     });
-  }, [hovered, clonedScene]);
+  }, [hovered, selected, clonedScene]);
 
   const startHolding = useCallback((e: any) => {
     e.stopPropagation();
+    if (e.nativeEvent?.shiftKey ?? e.shiftKey) {
+      onToggleSelect(data.id);
+      return;
+    }
     if (e.target && typeof e.target.setPointerCapture === "function") {
       e.target.setPointerCapture(e.pointerId);
     }
@@ -337,7 +384,7 @@ function Panel({
     setDragging(true);
     onHoldingChange(data.id);
     document.body.style.cursor = "grabbing";
-  }, [data.id, data.position, onHoldingChange]);
+  }, [data.id, data.position, onHoldingChange, onToggleSelect]);
 
   const stopHolding = useCallback((e?: any) => {
     if (e?.target && typeof e.target.releasePointerCapture === "function") {
@@ -741,6 +788,9 @@ function SceneContent({
   onRemovePanel,
   onMovePanel,
   onRotatePanel,
+  selectedPanelIds,
+  onTogglePanelSelect,
+  onMovePanelsZ,
   highlights,
   pickingSlots,
   selectedSlots,
@@ -764,6 +814,9 @@ function SceneContent({
   onRemovePanel: (id: string) => void;
   onMovePanel: (id: string, position: [number, number, number]) => void;
   onRotatePanel: (id: string, quaternion: [number, number, number, number]) => void;
+  selectedPanelIds: Set<string>;
+  onTogglePanelSelect: (id: string) => void;
+  onMovePanelsZ: (ids: Set<string>, deltaZ: number) => void;
   highlights: Candidate[];
   pickingSlots: PanelData[] | null;
   selectedSlots: Set<string>;
@@ -811,22 +864,13 @@ function SceneContent({
       const active = panels.find((p) => p.id === heldPanelId);
       if (!active) return;
 
-      if (event.key === "ArrowUp") {
+      if (event.key === "ArrowUp" || event.key === "ArrowDown") {
         event.preventDefault();
-        onMovePanel(heldPanelId, [
-          active.position[0],
-          active.position[1],
-          active.position[2] + 0.1,
-        ]);
-      }
-
-      if (event.key === "ArrowDown") {
-        event.preventDefault();
-        onMovePanel(heldPanelId, [
-          active.position[0],
-          active.position[1],
-          active.position[2] - 0.1,
-        ]);
+        const delta = event.key === "ArrowUp" ? 0.1 : -0.1;
+        const idsToMove = selectedPanelIds.size > 0 && selectedPanelIds.has(heldPanelId)
+          ? selectedPanelIds
+          : new Set([heldPanelId]);
+        onMovePanelsZ(idsToMove, delta);
       }
 
       if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
@@ -846,7 +890,7 @@ function SceneContent({
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [heldPanelId, onMovePanel, onRotatePanel, onRemovePanel, panels]);
+  }, [heldPanelId, selectedPanelIds, onMovePanelsZ, onRotatePanel, onRemovePanel, panels]);
 
   return (
     <>
@@ -869,8 +913,10 @@ function SceneContent({
         <Panel
           key={p.id}
           data={p}
+          selected={selectedPanelIds.has(p.id)}
           onMove={onMovePanel}
           onHoldingChange={setHeldPanelId}
+          onToggleSelect={onTogglePanelSelect}
         />
       ))}
       {highlights.map((c) => (
@@ -1012,6 +1058,25 @@ export default function SolarViewer() {
   const [previewYawDeg, setPreviewYawDeg] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addingMoreRef = useRef(false);
+
+  const [selectedPanelIds, setSelectedPanelIds] = useState<Set<string>>(new Set());
+
+  const togglePanelSelect = useCallback((id: string) => {
+    setSelectedPanelIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelectedPanelIds(new Set());
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // Commit a permanent panel from a hover pose — used by the BVH snap handler.
   const placeFromSnap = useCallback((pose: SnapPose) => {
@@ -1306,11 +1371,31 @@ export default function SolarViewer() {
   }, []);
 
   const movePanel = useCallback((id: string, position: [number, number, number]) => {
-    setPanels((prev) => prev.map((panel) => (panel.id === id ? { ...panel, position } : panel)));
+    setPanels((prev) => {
+      const moving = prev.find((p) => p.id === id);
+      if (!moving) return prev;
+      const candidate = { ...moving, position };
+      if (prev.some((p) => p.id !== id && panelsOverlap(candidate, p))) return prev;
+      return prev.map((p) => (p.id === id ? candidate : p));
+    });
   }, []);
 
   const rotatePanel = useCallback((id: string, quaternion: [number, number, number, number]) => {
-    setPanels((prev) => prev.map((panel) => (panel.id === id ? { ...panel, quaternion } : panel)));
+    setPanels((prev) => {
+      const panel = prev.find((p) => p.id === id);
+      if (!panel) return prev;
+      const candidate = { ...panel, quaternion };
+      if (prev.some((p) => p.id !== id && panelsOverlap(candidate, p))) return prev;
+      return prev.map((p) => (p.id === id ? candidate : p));
+    });
+  }, []);
+
+  const movePanelsZ = useCallback((ids: Set<string>, deltaZ: number) => {
+    setPanels((prev) => prev.map((p) =>
+      ids.has(p.id)
+        ? { ...p, position: [p.position[0], p.position[1], p.position[2] + deltaZ] }
+        : p
+    ));
   }, []);
 
   const clearPanels = useCallback(() => {
@@ -1320,6 +1405,7 @@ export default function SolarViewer() {
     setSelectedGridCells(new Set());
     setGridSelectionMode(false);
     setSelectedSlots(new Set());
+    setSelectedPanelIds(new Set());
     setPlacementMode(null);
     setHoverPose(null);
     setError(null);
@@ -1362,6 +1448,9 @@ export default function SolarViewer() {
               onRemovePanel={removePanel}
               onMovePanel={movePanel}
               onRotatePanel={rotatePanel}
+              selectedPanelIds={selectedPanelIds}
+              onTogglePanelSelect={togglePanelSelect}
+              onMovePanelsZ={movePanelsZ}
               highlights={showHighlights ? highlights : []}
               pickingSlots={pickingSlots}
               selectedSlots={selectedSlots}
