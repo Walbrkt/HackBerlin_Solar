@@ -38,11 +38,131 @@ import { indexModelForBVH } from "@/lib/bvh-setup";
 // €/panel and €/kWh used for the live HUD; mirrors backend constants.
 const PRICE_PER_PANEL = 1500;
 const PRICE_PER_KWH_BATTERY = 800;
-// Local "out" axis of the BoxGeometry-based panel preview (Z is the thin axis).
+// Panel's local "out" axis (the BoxGeometry depth axis is Z, the GLB models we
+// load are oriented so their face normal also points along local +Z).
 const PANEL_LOCAL_NORMAL = new THREE.Vector3(0, 0, 1);
+// World up — these models are Z-up (see model.box.min.z usage below).
+const WORLD_UP = new THREE.Vector3(0, 0, 1);
 
-const FLAT_PANEL_URL = "/solar_panels/solar_panel_flat.glb";
+/**
+ * Registry of panel .glb assets. To add another model from Sketchfab:
+ *   1. Drop the file under `public/solar_panels/<name>.glb`.
+ *   2. Add an entry below: `{ url: "/solar_panels/<name>.glb", label: "..." }`.
+ *   3. Make sure the model's face normal is along local +Z (same convention
+ *      the flat panel uses); otherwise re-export with the correct orientation.
+ *   4. The Panel component auto-fits the GLB to `data.width × data.height`
+ *      via a Box3 measurement, so any reasonable size works.
+ */
+const PANEL_MODELS = {
+  flat: { url: "/solar_panels/solar_panel_flat.glb", label: "Flat panel" },
+} as const;
+type PanelModelKey = keyof typeof PANEL_MODELS;
+const ACTIVE_PANEL_MODEL: PanelModelKey = "flat";
+const FLAT_PANEL_URL = PANEL_MODELS[ACTIVE_PANEL_MODEL].url;
 useGLTF.preload(FLAT_PANEL_URL);
+
+/**
+ * Sample the BVH-indexed `model` around `origin` and return up to `count`
+ * parallel panel poses spread on a rectangular grid in the surface tangent
+ * plane. Each candidate is verified by raycasting from above the local frame
+ * downward; cells that miss the model or land on a face whose normal differs
+ * from the origin's by more than `maxNormalDeg` are skipped (e.g. dormers,
+ * walls, ground). Result is sorted by distance from origin so the closest
+ * accepted slots are kept first.
+ */
+function proposeLayout(
+  origin: SnapPose,
+  count: number,
+  model: THREE.Object3D,
+  opts: { gap?: number; maxNormalDeg?: number; lift?: number } = {},
+): SnapPose[] {
+  const gap = opts.gap ?? 0.15; // metres between panels
+  const maxNormalDeg = opts.maxNormalDeg ?? 25;
+  const lift = opts.lift ?? 5; // ray origin offset above the surface
+  const stepU = PANEL_W + gap;
+  const stepV = PANEL_H + gap;
+  // Keep all panels parallel to the origin's orientation (clean rows on a roof
+  // plane). On strongly curved surfaces this becomes a fallback you'd revisit.
+  const originPos = new THREE.Vector3(...origin.position);
+  const originQ = new THREE.Quaternion(...origin.quaternion);
+  const xAxis = new THREE.Vector3(1, 0, 0).applyQuaternion(originQ);
+  const yAxis = new THREE.Vector3(0, 1, 0).applyQuaternion(originQ);
+  const zAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(originQ);
+
+  // Search radius: enough to cover `count` panels even if half the cells fail.
+  const span = Math.max(4, Math.ceil(Math.sqrt(count)) + 3);
+  const cosLimit = Math.cos(THREE.MathUtils.degToRad(maxNormalDeg));
+  const raycaster = new THREE.Raycaster();
+  const tmpNormal = new THREE.Vector3();
+
+  const candidates: { pose: SnapPose; dist: number }[] = [];
+
+  for (let i = -span; i <= span; i++) {
+    for (let j = -span; j <= span; j++) {
+      // Target point in the origin's tangent plane.
+      const target = originPos
+        .clone()
+        .addScaledVector(xAxis, i * stepU)
+        .addScaledVector(yAxis, j * stepV);
+      // Cast a ray from above the tangent plane back along -normal.
+      const rayOrigin = target.clone().addScaledVector(zAxis, lift);
+      raycaster.set(rayOrigin, zAxis.clone().negate());
+      const hits = raycaster.intersectObject(model, true);
+      const hit = hits[0];
+      if (!hit || !hit.face) continue;
+
+      tmpNormal
+        .copy(hit.face.normal)
+        .transformDirection(hit.object.matrixWorld)
+        .normalize();
+      if (tmpNormal.dot(zAxis) < cosLimit) continue;
+
+      candidates.push({
+        pose: {
+          // Place at the actual hit point so the panel hugs the surface.
+          position: [hit.point.x, hit.point.y, hit.point.z],
+          quaternion: [...origin.quaternion],
+        },
+        dist: target.distanceTo(originPos),
+      });
+    }
+  }
+
+  candidates.sort((a, b) => a.dist - b.dist);
+  return candidates.slice(0, count).map((c) => c.pose);
+}
+
+/**
+ * Build a panel pose from a surface hit. The panel's local Z is rotated to
+ * align with the world-space surface normal; X is forced to be horizontal
+ * (along the eave on a sloped roof), with `yawRad` rotating around the normal
+ * for user-controlled in-plane rotation.
+ *
+ * Edge case: when the surface is perfectly horizontal (flat roof), the
+ * "horizontal X" direction is undefined — fall back to world X.
+ */
+function surfacePoseFromHit(
+  point: THREE.Vector3,
+  worldNormal: THREE.Vector3,
+  yawRad: number,
+): SnapPose {
+  const z = worldNormal.clone().normalize();
+  let x = new THREE.Vector3().crossVectors(WORLD_UP, z);
+  if (x.lengthSq() < 1e-6) x.set(1, 0, 0); // flat roof: pick world X.
+  x.normalize();
+  const y = new THREE.Vector3().crossVectors(z, x).normalize();
+  // Build the base rotation: columns are the panel's local X/Y/Z in world coords.
+  const baseQ = new THREE.Quaternion().setFromRotationMatrix(
+    new THREE.Matrix4().makeBasis(x, y, z),
+  );
+  // Apply user yaw around the panel's local Z (= surface normal).
+  const yawQ = new THREE.Quaternion().setFromAxisAngle(PANEL_LOCAL_NORMAL, yawRad);
+  baseQ.multiply(yawQ);
+  return {
+    position: [point.x, point.y, point.z],
+    quaternion: [baseQ.x, baseQ.y, baseQ.z, baseQ.w],
+  };
+}
 
 const COST_PER_PANEL = 250;
 const PANEL_W = 1.0;
@@ -76,35 +196,34 @@ type SnapPose = {
 
 // Renders the loaded model. When `snap` props are provided, attaches pointer
 // handlers so hovering over the surface emits a BVH-accelerated snap pose and
-// clicking commits a permanent panel.
+// clicking commits a permanent panel. `yawRad` rotates the snap orientation
+// around the surface normal so the user can spin the preview before dropping.
 function ModelMesh({
   object,
   snap,
 }: {
   object: THREE.Object3D;
   snap?: {
+    yawRad: number;
     onHover: (pose: SnapPose | null) => void;
     onPlace: (pose: SnapPose) => void;
   };
 }) {
   // Reusable scratch — created once, reused on every pointermove.
-  const tmpQuatRef = useRef(new THREE.Quaternion());
   const tmpNormalRef = useRef(new THREE.Vector3());
 
-  const poseFromEvent = useCallback((e: any): SnapPose | null => {
-    if (!e.face) return null;
-    // face.normal is in the hit object's LOCAL space — promote to world.
-    tmpNormalRef.current
-      .copy(e.face.normal)
-      .transformDirection(e.object.matrixWorld)
-      .normalize();
-    tmpQuatRef.current.setFromUnitVectors(PANEL_LOCAL_NORMAL, tmpNormalRef.current);
-    const q = tmpQuatRef.current;
-    return {
-      position: [e.point.x, e.point.y, e.point.z],
-      quaternion: [q.x, q.y, q.z, q.w],
-    };
-  }, []);
+  const poseFromEvent = useCallback(
+    (e: any, yawRad: number): SnapPose | null => {
+      if (!e.face) return null;
+      // face.normal is in the hit object's LOCAL space — promote to world.
+      tmpNormalRef.current
+        .copy(e.face.normal)
+        .transformDirection(e.object.matrixWorld)
+        .normalize();
+      return surfacePoseFromHit(e.point, tmpNormalRef.current, yawRad);
+    },
+    [],
+  );
 
   if (!snap) return <primitive object={object} />;
 
@@ -113,7 +232,7 @@ function ModelMesh({
       object={object}
       onPointerMove={(e: any) => {
         e.stopPropagation();
-        const pose = poseFromEvent(e);
+        const pose = poseFromEvent(e, snap.yawRad);
         if (pose) snap.onHover(pose);
       }}
       onPointerOut={() => snap.onHover(null)}
@@ -121,7 +240,7 @@ function ModelMesh({
         // onClick fires only on a non-dragged left click — leaves drag-to-rotate intact.
         if (e.button !== 0) return;
         e.stopPropagation();
-        const pose = poseFromEvent(e);
+        const pose = poseFromEvent(e, snap.yawRad);
         if (pose) snap.onPlace(pose);
       }}
     />
@@ -636,6 +755,7 @@ function SceneContent({
   onToggleGridCell,
   freePlacementMode,
   hoverPose,
+  previewYawRad,
   onSnapHover,
   onSnapPlace,
 }: {
@@ -658,6 +778,7 @@ function SceneContent({
   onToggleGridCell: (key: string) => void;
   freePlacementMode: boolean;
   hoverPose: SnapPose | null;
+  previewYawRad: number;
   onSnapHover: (pose: SnapPose | null) => void;
   onSnapPlace: (pose: SnapPose) => void;
 }) {
@@ -738,7 +859,7 @@ function SceneContent({
           object={model}
           snap={
             freePlacementMode
-              ? { onHover: onSnapHover, onPlace: onSnapPlace }
+              ? { yawRad: previewYawRad, onHover: onSnapHover, onPlace: onSnapPlace }
               : undefined
           }
         />
@@ -888,6 +1009,7 @@ export default function SolarViewer() {
   const [recommendation, setRecommendation] = useState<DesignFromPromptResponse | null>(null);
   const [freePlacementMode, setFreePlacementMode] = useState(false);
   const [hoverPose, setHoverPose] = useState<SnapPose | null>(null);
+  const [previewYawDeg, setPreviewYawDeg] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addingMoreRef = useRef(false);
 
@@ -905,6 +1027,67 @@ export default function SolarViewer() {
       },
     ]);
   }, []);
+
+  // Auto-layout: uses the current hover pose as the seed and grows a parallel
+  // panel grid outward, sampling the BVH to skip non-roof cells. Replaces the
+  // current panel set so the user can iterate on different seed points.
+  const proposeDesign = useCallback(() => {
+    if (!model || !recommendation) {
+      setError("Load a model and run a prompt first.");
+      return;
+    }
+    if (!hoverPose) {
+      setError("Hover over the roof in free-placement mode, then press Propose.");
+      return;
+    }
+    const target = recommendation.design.panels_needed;
+    const layout = proposeLayout(hoverPose, target, model, {
+      gap: 0.2,
+      maxNormalDeg: 25,
+    });
+    if (layout.length === 0) {
+      setError("Couldn't fit panels around that point. Try a flatter spot on the roof.");
+      return;
+    }
+    setPanels(
+      layout.map((pose) => ({
+        id: crypto.randomUUID(),
+        position: pose.position,
+        quaternion: pose.quaternion,
+        width: PANEL_W,
+        height: PANEL_H,
+        depth: 0.18,
+      })),
+    );
+    setError(
+      layout.length < target
+        ? `Placed ${layout.length} of ${target} — surface ran out around the seed.`
+        : null,
+    );
+  }, [model, recommendation, hoverPose]);
+
+  // Q / E rotate the preview yaw by ±15°, R resets to 0. Active only while
+  // free-placement mode is on. Doesn't fire when an input/textarea has focus.
+  useEffect(() => {
+    if (!freePlacementMode) return;
+    const onKey = (event: KeyboardEvent) => {
+      const t = event.target as HTMLElement | null;
+      if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+      const k = event.key.toLowerCase();
+      if (k === "q") {
+        event.preventDefault();
+        setPreviewYawDeg((d) => (d - 15 + 360) % 360);
+      } else if (k === "e") {
+        event.preventDefault();
+        setPreviewYawDeg((d) => (d + 15) % 360);
+      } else if (k === "r") {
+        event.preventDefault();
+        setPreviewYawDeg(0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [freePlacementMode]);
 
   const snapHeightOffset = useCallback((value: number) => {
     const maxHeight = GRID_SIZE / 2;
@@ -1192,6 +1375,7 @@ export default function SolarViewer() {
               onToggleGridCell={toggleGridCell}
               freePlacementMode={freePlacementMode}
               hoverPose={hoverPose}
+              previewYawRad={THREE.MathUtils.degToRad(previewYawDeg)}
               onSnapHover={setHoverPose}
               onSnapPlace={placeFromSnap}
             />
@@ -1566,11 +1750,34 @@ export default function SolarViewer() {
             onClick={() => {
               setFreePlacementMode((v) => !v);
               setHoverPose(null);
+              setPreviewYawDeg(0);
             }}
             disabled={!model || loading}
           >
             <MousePointerClick className="mr-2 h-4 w-4" />
             {freePlacementMode ? "Stop free placement" : "Free placement (hover & click)"}
+          </Button>
+
+          {freePlacementMode && (
+            <p className="rounded-md border border-border bg-background/50 px-3 py-2 text-[11px] text-muted-foreground">
+              <span className="font-medium text-foreground">Q / E</span> rotate preview ±15°,
+              {" "}<span className="font-medium text-foreground">R</span> reset.
+              Drag a placed panel; hold it and use{" "}
+              <span className="font-medium text-foreground">←/→</span> to rotate,{" "}
+              <span className="font-medium text-foreground">↑/↓</span> to lift,{" "}
+              <span className="font-medium text-foreground">Backspace</span> to delete.
+              {" "}Yaw: <span className="font-mono text-foreground">{previewYawDeg}°</span>
+            </p>
+          )}
+
+          <Button
+            variant="secondary"
+            className="w-full"
+            onClick={proposeDesign}
+            disabled={!model || loading || !recommendation || !hoverPose}
+          >
+            <Sparkles className="mr-2 h-4 w-4" />
+            Propose a design ({recommendation?.design.panels_needed ?? "?"} panels)
           </Button>
 
           <Button
