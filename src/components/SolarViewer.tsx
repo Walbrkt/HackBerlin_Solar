@@ -889,6 +889,7 @@ export default function SolarViewer() {
   const [freePlacementMode, setFreePlacementMode] = useState(false);
   const [hoverPose, setHoverPose] = useState<SnapPose | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const addingMoreRef = useRef(false);
 
   // Commit a permanent panel from a hover pose — used by the BVH snap handler.
   const placeFromSnap = useCallback((pose: SnapPose) => {
@@ -1021,7 +1022,12 @@ export default function SolarViewer() {
         depth: boxDepth,
       } as PanelData;
     });
-    setPanels(cellPanels);
+    if (addingMoreRef.current) {
+      setPanels((prev) => [...prev, ...cellPanels]);
+      addingMoreRef.current = false;
+    } else {
+      setPanels(cellPanels);
+    }
     setPlacementMode(null);
     setShowHighlights(false);
     setSelectedSlots(new Set());
@@ -1077,6 +1083,17 @@ export default function SolarViewer() {
     }
     placeSelectedAreas();
   }, [model, gridConfigured, highlights, placeSelectedAreas]);
+
+  const openAddMore = useCallback(() => {
+    if (!model || !gridConfigured) return;
+    addingMoreRef.current = true;
+    setHighlights([]);
+    setShowHighlights(false);
+    setShowCoordinateGrid(true);
+    setSelectedGridCells(new Set());
+    setGridSelectionMode(true);
+    setError("Select roof cells to add more panels, then click Confirm.");
+  }, [model, gridConfigured]);
 
   const toggleSlot = useCallback((id: string) => {
     setSelectedSlots((prev) => {
@@ -1256,8 +1273,8 @@ export default function SolarViewer() {
           <div className="pointer-events-none absolute right-4 top-4 max-w-xs rounded-md border border-border bg-card/90 p-3 text-xs shadow-lg backdrop-blur">
             <p className="mb-1 font-semibold text-foreground">Panel controls</p>
             <p className="text-muted-foreground">
-              Click and drag a panel to move on X/Y. While holding it, press Arrow Up or Arrow
-              Down to move on Z. While holding it, press Backspace to delete.
+              Click and drag a panel to move on X/Y. While holding it: Arrow Up/Down to move on
+              Z, Arrow Left/Right to rotate 15°, Backspace to delete.
             </p>
           </div>
         )}
@@ -1556,6 +1573,15 @@ export default function SolarViewer() {
             {freePlacementMode ? "Stop free placement" : "Free placement (hover & click)"}
           </Button>
 
+          <Button
+            variant="outline"
+            className="w-full"
+            onClick={openAddMore}
+            disabled={panels.length === 0 || !gridConfigured || loading || placementMode === "picking"}
+          >
+            <Sun className="mr-2 h-4 w-4" />
+            Add more solar panels
+          </Button>
           <Button
             variant="outline"
             className="w-full"
