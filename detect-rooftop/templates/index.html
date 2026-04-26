@@ -1,0 +1,603 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Solar Roof Designer</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --panel: rgba(20, 27, 31, 0.88);
+        --panel-border: rgba(255, 255, 255, 0.12);
+        --text: #eef7f4;
+        --muted: #9fb2ad;
+        --accent: #44f2a4;
+        --accent-2: #4db9ff;
+        --danger: #ff6d7a;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        overflow: hidden;
+        background: #101417;
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      #app {
+        position: relative;
+        width: 100vw;
+        height: 100vh;
+      }
+
+      #viewer {
+        position: absolute;
+        inset: 0;
+      }
+
+      .topbar {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        right: 16px;
+        z-index: 10;
+        display: grid;
+        grid-template-columns: minmax(260px, 420px) minmax(220px, 1fr);
+        gap: 12px;
+        align-items: start;
+        pointer-events: none;
+      }
+
+      .panel {
+        pointer-events: auto;
+        border: 1px solid var(--panel-border);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: 0 18px 50px rgba(0, 0, 0, 0.28);
+        backdrop-filter: blur(14px);
+      }
+
+      .upload-panel {
+        padding: 14px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
+
+      .brand-mark {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background:
+          radial-gradient(circle at 35% 35%, #ffffff 0 10%, transparent 11%),
+          conic-gradient(from 210deg, var(--accent), var(--accent-2), #ffd166, var(--accent));
+        box-shadow: 0 0 26px rgba(68, 242, 164, 0.45);
+        flex: 0 0 auto;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.15;
+        font-weight: 750;
+        letter-spacing: 0;
+      }
+
+      .subtitle {
+        margin: 2px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .controls {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      input[type="file"] {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+      }
+
+      button,
+      .file-button {
+        display: inline-flex;
+        min-height: 38px;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 6px;
+        padding: 0 12px;
+        background: rgba(255, 255, 255, 0.08);
+        color: var(--text);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      button.primary,
+      .file-button.primary {
+        border-color: rgba(68, 242, 164, 0.55);
+        background: rgba(68, 242, 164, 0.18);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.5;
+      }
+
+      .status {
+        margin-top: 10px;
+        min-height: 18px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .stats-panel {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(120px, 1fr));
+        gap: 1px;
+        overflow: hidden;
+      }
+
+      .metric {
+        padding: 12px 14px;
+        background: rgba(255, 255, 255, 0.035);
+      }
+
+      .metric span {
+        display: block;
+        color: var(--muted);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 4px;
+        font-size: 20px;
+        line-height: 1.1;
+      }
+
+      .roof-list {
+        position: absolute;
+        right: 16px;
+        bottom: 16px;
+        z-index: 10;
+        width: min(360px, calc(100vw - 32px));
+        max-height: 36vh;
+        overflow: auto;
+        padding: 10px;
+        pointer-events: auto;
+      }
+
+      .roof-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 6px;
+        padding: 9px 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+        font-size: 13px;
+      }
+
+      .roof-row:last-child {
+        border-bottom: 0;
+      }
+
+      .roof-row small {
+        color: var(--muted);
+      }
+
+      .empty-state {
+        position: absolute;
+        left: 50%;
+        top: 54%;
+        z-index: 5;
+        width: min(420px, calc(100vw - 32px));
+        transform: translate(-50%, -50%);
+        color: var(--muted);
+        text-align: center;
+        font-size: 14px;
+        line-height: 1.5;
+        pointer-events: none;
+      }
+
+      .dimension-label {
+        border: 1px solid rgba(68, 242, 164, 0.45);
+        border-radius: 6px;
+        padding: 5px 8px;
+        background: rgba(3, 16, 14, 0.78);
+        color: #d9fff0;
+        box-shadow: 0 0 22px rgba(68, 242, 164, 0.35);
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+        transform: translateY(-8px);
+      }
+
+      canvas {
+        display: block;
+      }
+
+      @media (max-width: 760px) {
+        .topbar {
+          grid-template-columns: 1fr;
+        }
+
+        .stats-panel {
+          grid-template-columns: repeat(3, 1fr);
+        }
+
+        .metric {
+          padding: 10px;
+        }
+
+        .metric strong {
+          font-size: 16px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="viewer"></div>
+
+      <div class="topbar">
+        <section class="panel upload-panel">
+          <div class="brand">
+            <div class="brand-mark" aria-hidden="true"></div>
+            <div>
+              <h1>AI Solar Roof Designer</h1>
+              <p class="subtitle">Upload a GLB building model to detect usable flat roof planes.</p>
+            </div>
+          </div>
+
+          <div class="controls">
+            <label class="file-button primary" for="modelInput">Choose GLB</label>
+            <button id="uploadButton" type="button" disabled>Analyze</button>
+          </div>
+          <input id="modelInput" type="file" accept=".glb,model/gltf-binary" />
+          <div id="status" class="status">No model selected.</div>
+        </section>
+
+        <section class="panel stats-panel" aria-live="polite">
+          <div class="metric">
+            <span>Roofs</span>
+            <strong id="roofCount">0</strong>
+          </div>
+          <div class="metric">
+            <span>Total Area</span>
+            <strong id="totalArea">0 m²</strong>
+          </div>
+          <div class="metric">
+            <span>Largest</span>
+            <strong id="largestRoof">0 m²</strong>
+          </div>
+        </section>
+      </div>
+
+      <div id="emptyState" class="empty-state">
+        Drop in a building model and the roof detector will highlight upward planar surfaces for solar layout.
+      </div>
+
+      <section id="roofList" class="panel roof-list" hidden></section>
+    </div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+      import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
+      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+      import { CSS2DObject, CSS2DRenderer } from "three/addons/renderers/CSS2DRenderer.js";
+
+      const viewer = document.querySelector("#viewer");
+      const input = document.querySelector("#modelInput");
+      const uploadButton = document.querySelector("#uploadButton");
+      const statusEl = document.querySelector("#status");
+      const emptyState = document.querySelector("#emptyState");
+      const roofList = document.querySelector("#roofList");
+      const roofCount = document.querySelector("#roofCount");
+      const totalArea = document.querySelector("#totalArea");
+      const largestRoof = document.querySelector("#largestRoof");
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x101417);
+
+      const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.01, 10000);
+      camera.position.set(9, -10, 7);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      viewer.appendChild(renderer.domElement);
+
+      const labelRenderer = new CSS2DRenderer();
+      labelRenderer.setSize(window.innerWidth, window.innerHeight);
+      labelRenderer.domElement.style.position = "absolute";
+      labelRenderer.domElement.style.inset = "0";
+      labelRenderer.domElement.style.pointerEvents = "none";
+      viewer.appendChild(labelRenderer.domElement);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.08;
+
+      const modelGroup = new THREE.Group();
+      const overlayGroup = new THREE.Group();
+      const labelGroup = new THREE.Group();
+      scene.add(modelGroup, overlayGroup, labelGroup);
+
+      const hemiLight = new THREE.HemisphereLight(0xffffff, 0x263238, 2.2);
+      scene.add(hemiLight);
+
+      const keyLight = new THREE.DirectionalLight(0xffffff, 2.4);
+      keyLight.position.set(5, -6, 9);
+      scene.add(keyLight);
+
+      const grid = new THREE.GridHelper(24, 24, 0x2c4f49, 0x20302f);
+      grid.rotation.x = Math.PI / 2;
+      scene.add(grid);
+
+      const dracoLoader = new DRACOLoader();
+      dracoLoader.setDecoderPath("https://unpkg.com/three@0.160.0/examples/jsm/libs/draco/");
+
+      const loader = new GLTFLoader();
+      loader.setDRACOLoader(dracoLoader);
+      let selectedFile = null;
+      let modelObjectUrl = null;
+
+      input.addEventListener("change", () => {
+        selectedFile = input.files?.[0] ?? null;
+        uploadButton.disabled = !selectedFile;
+        resetAnalysis();
+
+        if (!selectedFile) {
+          setStatus("No model selected.");
+          return;
+        }
+
+        if (!selectedFile.name.toLowerCase().endsWith(".glb")) {
+          uploadButton.disabled = true;
+          setStatus("Please choose a binary .glb model file.", true);
+          return;
+        }
+
+        setStatus(`Selected ${selectedFile.name}. Ready to analyze.`);
+        loadLocalModel(selectedFile);
+      });
+
+      uploadButton.addEventListener("click", async () => {
+        if (!selectedFile) return;
+
+        uploadButton.disabled = true;
+        setStatus("Uploading and detecting roof planes...");
+        resetAnalysis({ keepModel: true });
+
+        const formData = new FormData();
+        formData.append("file", selectedFile);
+
+        try {
+          const response = await fetch("/upload-model/", {
+            method: "POST",
+            body: formData,
+          });
+
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.detail || "The backend could not process this model.");
+          }
+
+          drawRoofAnalysis(payload);
+          const detectedCount = payload.detected_roof_count ?? payload.roof_count;
+          const limited = detectedCount > payload.roof_count;
+          setStatus(
+            limited
+              ? `Detected ${detectedCount} roof candidates. Showing largest ${payload.roof_count}.`
+              : `Detected ${payload.roof_count} roof plane${payload.roof_count === 1 ? "" : "s"}.`,
+          );
+        } catch (error) {
+          setStatus(error.message, true);
+        } finally {
+          uploadButton.disabled = false;
+        }
+      });
+
+      function loadLocalModel(file) {
+        clearGroup(modelGroup);
+        emptyState.hidden = true;
+
+        if (modelObjectUrl) {
+          URL.revokeObjectURL(modelObjectUrl);
+        }
+
+        modelObjectUrl = URL.createObjectURL(file);
+        loader.load(
+          modelObjectUrl,
+          (gltf) => {
+            const model = gltf.scene;
+            model.traverse((child) => {
+              if (child.isMesh) {
+                child.castShadow = true;
+                child.receiveShadow = true;
+                if (child.material) {
+                  child.material = child.material.clone();
+                  child.material.transparent = true;
+                  child.material.opacity = 0.72;
+                }
+              }
+            });
+            modelGroup.add(model);
+            frameObject(modelGroup);
+          },
+          undefined,
+          (error) => {
+            console.error(error);
+            setStatus("Could not preview the GLB in the browser.", true);
+          },
+        );
+      }
+
+      function drawRoofAnalysis(payload) {
+        clearGroup(overlayGroup);
+        clearGroup(labelGroup);
+
+        roofCount.textContent = payload.roof_count ?? 0;
+        totalArea.textContent = `${formatNumber(payload.total_roof_area_m2 ?? 0)} m²`;
+        largestRoof.textContent = `${formatNumber(payload.roofs?.[0]?.area_m2 ?? 0)} m²`;
+
+        roofList.innerHTML = "";
+        roofList.hidden = !payload.roofs?.length;
+
+        for (const roof of payload.roofs ?? []) {
+          const geometry = new THREE.BufferGeometry();
+          const positions = new Float32Array(roof.vertices.flat());
+          geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          geometry.setIndex(roof.indices);
+          geometry.computeVertexNormals();
+
+          const material = new THREE.MeshBasicMaterial({
+            color: 0x44f2a4,
+            transparent: true,
+            opacity: 0.38,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+            blending: THREE.AdditiveBlending,
+          });
+
+          const roofMesh = new THREE.Mesh(geometry, material);
+          overlayGroup.add(roofMesh);
+
+          const edges = new THREE.LineSegments(
+            new THREE.EdgesGeometry(geometry, 8),
+            new THREE.LineBasicMaterial({ color: 0x8dffd0, transparent: true, opacity: 0.95 }),
+          );
+          overlayGroup.add(edges);
+
+          const label = document.createElement("div");
+          label.className = "dimension-label";
+          label.textContent = `${formatNumber(roof.length_m)}m × ${formatNumber(roof.width_m)}m`;
+          const labelObject = new CSS2DObject(label);
+          labelObject.position.set(...roof.label_position);
+          labelGroup.add(labelObject);
+
+          const row = document.createElement("div");
+          row.className = "roof-row";
+          row.innerHTML = `
+            <div>
+              <strong>Roof ${roof.id}</strong><br />
+              <small>${formatNumber(roof.length_m)}m × ${formatNumber(roof.width_m)}m</small>
+            </div>
+            <strong>${formatNumber(roof.area_m2)} m²</strong>
+          `;
+          roofList.appendChild(row);
+        }
+      }
+
+      function resetAnalysis(options = {}) {
+        clearGroup(overlayGroup);
+        clearGroup(labelGroup);
+        roofCount.textContent = "0";
+        totalArea.textContent = "0 m²";
+        largestRoof.textContent = "0 m²";
+        roofList.hidden = true;
+        roofList.innerHTML = "";
+
+        if (!options.keepModel) {
+          clearGroup(modelGroup);
+          emptyState.hidden = false;
+        }
+      }
+
+      function clearGroup(group) {
+        while (group.children.length) {
+          const child = group.children.pop();
+          child.traverse?.((node) => {
+            node.geometry?.dispose?.();
+            if (Array.isArray(node.material)) {
+              node.material.forEach((material) => material.dispose?.());
+            } else {
+              node.material?.dispose?.();
+            }
+          });
+        }
+      }
+
+      function frameObject(object) {
+        const box = new THREE.Box3().setFromObject(object);
+        if (box.isEmpty()) return;
+
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const maxSize = Math.max(size.x, size.y, size.z);
+        const distance = maxSize / (2 * Math.tan((Math.PI * camera.fov) / 360));
+        const direction = new THREE.Vector3(1.1, -1.25, 0.85).normalize();
+
+        camera.near = Math.max(distance / 1000, 0.01);
+        camera.far = Math.max(distance * 100, 1000);
+        camera.position.copy(center).add(direction.multiplyScalar(distance * 1.65));
+        camera.updateProjectionMatrix();
+
+        controls.target.copy(center);
+        controls.update();
+      }
+
+      function setStatus(message, isError = false) {
+        statusEl.textContent = message;
+        statusEl.classList.toggle("error", isError);
+      }
+
+      function formatNumber(value) {
+        return Number(value || 0).toLocaleString(undefined, {
+          maximumFractionDigits: 2,
+        });
+      }
+
+      function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+        labelRenderer.render(scene, camera);
+      }
+
+      window.addEventListener("resize", () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        labelRenderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      animate();
+    </script>
+  </body>
+</html>
