@@ -38,6 +38,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 import joblib
 import pandas as pd
 import uvicorn

@@ -82,7 +82,11 @@ DEFAULTS: dict[str, float | int] = {
 
 
 def _api_key() -> Optional[str]:
-    return os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    return (
+        os.environ.get("GEMINI_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("GOOGLE_AI_API_KEY")
+    )
 
 
 def is_configured() -> bool:
