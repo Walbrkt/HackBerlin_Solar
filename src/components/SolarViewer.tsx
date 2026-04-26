@@ -47,89 +47,193 @@ const WORLD_UP = new THREE.Vector3(0, 0, 1);
 /**
  * Registry of panel .glb assets. To add another model from Sketchfab:
  *   1. Drop the file under `public/solar_panels/<name>.glb`.
- *   2. Add an entry below: `{ url: "/solar_panels/<name>.glb", label: "..." }`.
+ *   2. Add an entry below with its physical dimensions and price.
  *   3. Make sure the model's face normal is along local +Z (same convention
- *      the flat panel uses); otherwise re-export with the correct orientation.
+ *      the existing panels use); otherwise re-export with the correct orientation.
  *   4. The Panel component auto-fits the GLB to `data.width × data.height`
  *      via a Box3 measurement, so any reasonable size works.
+ *
+ * `flat` goes on horizontal surfaces; `slanted` is for tilted surfaces
+ * (assumes the slanted glb has a wedge / mounting frame baked in).
  */
 const PANEL_MODELS = {
-  flat: { url: "/solar_panels/solar_panel_flat.glb", label: "Flat panel" },
+  flat: {
+    url: "/solar_panels/solar_panel_flat.glb",
+    label: "Flat panel",
+    pricePerUnit: 1500, // EUR per panel including install — tune from supplier data.
+    width: 1.0,
+    height: 1.65,
+    depth: 0.18,
+    color: "hsl(140, 100%, 55%)", // preview tint
+  },
+  slanted: {
+    url: "/solar_panels/solar_panel_slanted.glb",
+    label: "Slanted (tilt-mounted) panel",
+    pricePerUnit: 1700, // wedge frame premium.
+    width: 1.0,
+    height: 1.65,
+    depth: 0.45,
+    color: "hsl(28, 95%, 60%)",
+  },
 } as const;
 type PanelModelKey = keyof typeof PANEL_MODELS;
-const ACTIVE_PANEL_MODEL: PanelModelKey = "flat";
-const FLAT_PANEL_URL = PANEL_MODELS[ACTIVE_PANEL_MODEL].url;
-useGLTF.preload(FLAT_PANEL_URL);
+
+// Preload both so swapping mid-session doesn't stall the canvas.
+useGLTF.preload(PANEL_MODELS.flat.url);
+useGLTF.preload(PANEL_MODELS.slanted.url);
+
+// Threshold (degrees from world-up) below which a surface is considered "flat".
+// Real flat roofs typically have a 1–5° drainage tilt; 10° is a safe cutoff.
+const FLAT_TILT_THRESHOLD_DEG = 10;
 
 /**
- * Sample the BVH-indexed `model` around `origin` and return up to `count`
- * parallel panel poses spread on a rectangular grid in the surface tangent
- * plane. Each candidate is verified by raycasting from above the local frame
- * downward; cells that miss the model or land on a face whose normal differs
- * from the origin's by more than `maxNormalDeg` are skipped (e.g. dormers,
- * walls, ground). Result is sorted by distance from origin so the closest
- * accepted slots are kept first.
+ * Pick the appropriate panel model for a hit normal.
+ *   - Flat surface (≤10° from world up) → flat panel laid directly on the roof.
+ *   - Tilted surface                     → slanted (tilt-frame) panel.
+ */
+function pickPanelModel(worldNormal: THREE.Vector3): PanelModelKey {
+  const tiltDeg = THREE.MathUtils.radToDeg(
+    Math.acos(THREE.MathUtils.clamp(worldNormal.dot(WORLD_UP), -1, 1)),
+  );
+  return tiltDeg <= FLAT_TILT_THRESHOLD_DEG ? "flat" : "slanted";
+}
+
+/**
+ * Auto-place up to `count` panel poses near `origin`, staying on the same roof
+ * surface. Implementation is a flood-fill (BFS) over a tangent-plane grid:
+ *
+ *   - Start at the seed cell `(0,0)`. Expand to its 4-neighbours.
+ *   - For each candidate cell, ray-cast straight along the seed's normal axis
+ *     (BVH-accelerated). Accept the cell only if the hit:
+ *        a) shares a normal with the seed within `maxNormalDeg`         (no walls / dormers),
+ *        b) lies within `maxPlaneOffset` of the seed's tangent plane    (no ground / trees), and
+ *        c) is no further than `maxJump` from its parent cell's hit pos (no jumping voids).
+ *   - Accepted cells push their neighbours; rejected cells become walls.
+ *   - Result keeps panels parallel to the seed orientation but each one is
+ *     placed at its actual hit point so it hugs the local surface.
+ *
+ * The (b) check is the one that distinguishes "house roof" from
+ * "ground / trees / lawn next to the house" when both happen to be flat —
+ * grid sampling alone can't tell them apart. (c) handles thin gaps where
+ * the ray punches straight through to the ground beyond the eaves.
+ *
+ * Each kept pose carries the cell's own normal, so callers can pick the
+ * appropriate panel model (flat/slanted) per cell.
  */
 function proposeLayout(
   origin: SnapPose,
   count: number,
   model: THREE.Object3D,
-  opts: { gap?: number; maxNormalDeg?: number; lift?: number } = {},
+  opts: {
+    gap?: number;
+    maxNormalDeg?: number;
+    /** Max signed distance from seed's tangent plane (metres). */
+    maxPlaneOffset?: number;
+    /** Max distance between adjacent accepted hit points (metres). */
+    maxJump?: number;
+    /** Search radius cap, in cells, to keep BFS bounded. */
+    maxRadius?: number;
+    /** Ray origin offset above the surface (metres). */
+    lift?: number;
+  } = {},
 ): SnapPose[] {
-  const gap = opts.gap ?? 0.15; // metres between panels
-  const maxNormalDeg = opts.maxNormalDeg ?? 25;
-  const lift = opts.lift ?? 5; // ray origin offset above the surface
+  const gap = opts.gap ?? 0.2;
+  const maxNormalDeg = opts.maxNormalDeg ?? 20;
+  const maxPlaneOffset = opts.maxPlaneOffset ?? 0.8;
+  const maxRadius = opts.maxRadius ?? Math.max(6, Math.ceil(Math.sqrt(count) * 2) + 3);
+  const lift = opts.lift ?? 5;
+
   const stepU = PANEL_W + gap;
   const stepV = PANEL_H + gap;
-  // Keep all panels parallel to the origin's orientation (clean rows on a roof
-  // plane). On strongly curved surfaces this becomes a fallback you'd revisit.
+  // Default maxJump must be larger than the longest cell step or the BFS will
+  // reject every legitimate neighbour. Allow an extra ~25% for slope geometry,
+  // and add the plane-tolerance so a cell whose hit sits at the edge of the
+  // tangent-plane band still passes.
+  const maxJump = opts.maxJump ?? Math.max(stepU, stepV) * 1.25 + maxPlaneOffset;
+
   const originPos = new THREE.Vector3(...origin.position);
   const originQ = new THREE.Quaternion(...origin.quaternion);
   const xAxis = new THREE.Vector3(1, 0, 0).applyQuaternion(originQ);
   const yAxis = new THREE.Vector3(0, 1, 0).applyQuaternion(originQ);
-  const zAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(originQ);
+  const zAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(originQ).normalize();
 
-  // Search radius: enough to cover `count` panels even if half the cells fail.
-  const span = Math.max(4, Math.ceil(Math.sqrt(count)) + 3);
   const cosLimit = Math.cos(THREE.MathUtils.degToRad(maxNormalDeg));
   const raycaster = new THREE.Raycaster();
   const tmpNormal = new THREE.Vector3();
 
-  const candidates: { pose: SnapPose; dist: number }[] = [];
+  type Cell = { i: number; j: number; parentHit: THREE.Vector3 };
+  const accepted = new Map<string, { pose: SnapPose; dist2: number }>();
+  const rejected = new Set<string>();
+  const queue: Cell[] = [{ i: 0, j: 0, parentHit: originPos.clone() }];
+  const key = (i: number, j: number) => `${i},${j}`;
 
-  for (let i = -span; i <= span; i++) {
-    for (let j = -span; j <= span; j++) {
-      // Target point in the origin's tangent plane.
-      const target = originPos
-        .clone()
-        .addScaledVector(xAxis, i * stepU)
-        .addScaledVector(yAxis, j * stepV);
-      // Cast a ray from above the tangent plane back along -normal.
-      const rayOrigin = target.clone().addScaledVector(zAxis, lift);
-      raycaster.set(rayOrigin, zAxis.clone().negate());
-      const hits = raycaster.intersectObject(model, true);
-      const hit = hits[0];
-      if (!hit || !hit.face) continue;
-
-      tmpNormal
-        .copy(hit.face.normal)
-        .transformDirection(hit.object.matrixWorld)
-        .normalize();
-      if (tmpNormal.dot(zAxis) < cosLimit) continue;
-
-      candidates.push({
-        pose: {
-          // Place at the actual hit point so the panel hugs the surface.
-          position: [hit.point.x, hit.point.y, hit.point.z],
-          quaternion: [...origin.quaternion],
-        },
-        dist: target.distanceTo(originPos),
-      });
+  while (queue.length > 0 && accepted.size < count * 3) {
+    const cell = queue.shift()!;
+    const k = key(cell.i, cell.j);
+    if (accepted.has(k) || rejected.has(k)) continue;
+    if (Math.abs(cell.i) > maxRadius || Math.abs(cell.j) > maxRadius) {
+      rejected.add(k);
+      continue;
     }
+
+    const target = originPos
+      .clone()
+      .addScaledVector(xAxis, cell.i * stepU)
+      .addScaledVector(yAxis, cell.j * stepV);
+    const rayOrigin = target.clone().addScaledVector(zAxis, lift);
+    raycaster.set(rayOrigin, zAxis.clone().negate());
+    const hits = raycaster.intersectObject(model, true);
+    const hit = hits[0];
+    if (!hit || !hit.face) {
+      rejected.add(k);
+      continue;
+    }
+
+    tmpNormal
+      .copy(hit.face.normal)
+      .transformDirection(hit.object.matrixWorld)
+      .normalize();
+
+    // (a) normal angle vs. seed normal
+    if (tmpNormal.dot(zAxis) < cosLimit) {
+      rejected.add(k);
+      continue;
+    }
+    // (b) signed distance from seed's tangent plane: filters ground/trees/lawn
+    const planeOffset = Math.abs(hit.point.clone().sub(originPos).dot(zAxis));
+    if (planeOffset > maxPlaneOffset) {
+      rejected.add(k);
+      continue;
+    }
+    // (c) reachable from parent without a big vertical jump
+    const jump = hit.point.distanceTo(cell.parentHit);
+    if (jump > maxJump) {
+      rejected.add(k);
+      continue;
+    }
+
+    const hitWorldNormal: [number, number, number] = [tmpNormal.x, tmpNormal.y, tmpNormal.z];
+    accepted.set(k, {
+      pose: {
+        position: [hit.point.x, hit.point.y, hit.point.z],
+        quaternion: [...origin.quaternion],
+        worldNormal: hitWorldNormal,
+      },
+      dist2: target.distanceToSquared(originPos),
+    });
+
+    // Expand to 4-neighbours.
+    const hitVec = hit.point.clone();
+    queue.push({ i: cell.i + 1, j: cell.j, parentHit: hitVec });
+    queue.push({ i: cell.i - 1, j: cell.j, parentHit: hitVec });
+    queue.push({ i: cell.i, j: cell.j + 1, parentHit: hitVec });
+    queue.push({ i: cell.i, j: cell.j - 1, parentHit: hitVec });
   }
 
-  candidates.sort((a, b) => a.dist - b.dist);
-  return candidates.slice(0, count).map((c) => c.pose);
+  return [...accepted.values()]
+    .sort((a, b) => a.dist2 - b.dist2)
+    .slice(0, count)
+    .map((c) => c.pose);
 }
 
 /**
@@ -161,6 +265,7 @@ function surfacePoseFromHit(
   return {
     position: [point.x, point.y, point.z],
     quaternion: [baseQ.x, baseQ.y, baseQ.z, baseQ.w],
+    worldNormal: [z.x, z.y, z.z],
   };
 }
 
@@ -179,6 +284,8 @@ type PanelData = {
   width: number;
   height: number;
   depth?: number;
+  /** Which GLB model to render this panel as. Defaults to "flat" if absent. */
+  modelKey?: PanelModelKey;
 };
 
 type Candidate = {
@@ -224,12 +331,16 @@ function panelsOverlap(a: PanelData, b: PanelData): boolean {
 type SnapPose = {
   position: [number, number, number];
   quaternion: [number, number, number, number];
+  /** World-space surface normal at the hit point — drives panel-model selection. */
+  worldNormal: [number, number, number];
 };
 
 // Renders the loaded model. When `snap` props are provided, attaches pointer
-// handlers so hovering over the surface emits a BVH-accelerated snap pose and
-// clicking commits a permanent panel. `yawRad` rotates the snap orientation
-// around the surface normal so the user can spin the preview before dropping.
+// handlers so hovering or clicking the surface emits a BVH-accelerated snap
+// pose. Placement is intentionally *not* committed on click — that goes
+// through the explicit Confirm action — so accidentally clicking on existing
+// panels never spawns extras. `yawRad` rotates the snap orientation around
+// the surface normal so the user can spin the preview before committing.
 function ModelMesh({
   object,
   snap,
@@ -238,7 +349,7 @@ function ModelMesh({
   snap?: {
     yawRad: number;
     onHover: (pose: SnapPose | null) => void;
-    onPlace: (pose: SnapPose) => void;
+    onAim: (pose: SnapPose) => void;
   };
 }) {
   // Reusable scratch — created once, reused on every pointermove.
@@ -269,25 +380,44 @@ function ModelMesh({
       }}
       onPointerOut={() => snap.onHover(null)}
       onClick={(e: any) => {
-        // onClick fires only on a non-dragged left click — leaves drag-to-rotate intact.
+        // Don't place — only "aim". The Confirm action (button or Enter key)
+        // commits a panel. This means clicks on placed Panel meshes never
+        // accidentally drop a duplicate panel through them.
         if (e.button !== 0) return;
+        // Bail if a non-model object (a placed Panel) is in front of us.
+        const front = e.intersections?.[0]?.object as THREE.Object3D | undefined;
+        if (front && !isDescendantOf(front, e.eventObject as THREE.Object3D)) return;
         e.stopPropagation();
         const pose = poseFromEvent(e, snap.yawRad);
-        if (pose) snap.onPlace(pose);
+        if (pose) snap.onAim(pose);
       }}
     />
   );
 }
 
+// Walk up the parent chain from `node` looking for `ancestor`.
+function isDescendantOf(node: THREE.Object3D, ancestor: THREE.Object3D): boolean {
+  let cur: THREE.Object3D | null = node;
+  while (cur) {
+    if (cur === ancestor) return true;
+    cur = cur.parent;
+  }
+  return false;
+}
+
 // Translucent preview rendered at the cursor in free-placement mode.
+// Box dimensions and color reflect the model that would actually be placed
+// (flat vs slanted), so the user sees which panel they're about to drop.
 function PreviewPanel({ pose }: { pose: SnapPose }) {
+  const modelKey = pickPanelModel(new THREE.Vector3(...pose.worldNormal));
+  const def = PANEL_MODELS[modelKey];
   return (
     <mesh position={pose.position} quaternion={pose.quaternion}>
-      <boxGeometry args={[PANEL_W, PANEL_H, 0.18]} />
+      <boxGeometry args={[def.width, def.height, def.depth]} />
       <meshStandardMaterial
-        color="hsl(140, 100%, 55%)"
-        emissive="hsl(140, 100%, 35%)"
-        emissiveIntensity={0.7}
+        color={def.color}
+        emissive={def.color}
+        emissiveIntensity={0.6}
         transparent
         opacity={0.55}
         depthWrite={false}
@@ -315,7 +445,9 @@ function Panel({
   const dragOffsetRef = useRef(new THREE.Vector3());
   const intersectionRef = useRef(new THREE.Vector3());
 
-  const { scene } = useGLTF(FLAT_PANEL_URL);
+  // Resolve the GLB url from the per-panel modelKey (default "flat" for legacy data).
+  const modelKey: PanelModelKey = data.modelKey ?? "flat";
+  const { scene } = useGLTF(PANEL_MODELS[modelKey].url);
 
   const [clonedScene, panelScale] = useMemo(() => {
     const clone = scene.clone(true);
@@ -426,6 +558,13 @@ function Panel({
         e.stopPropagation();
         setHovered(true);
         document.body.style.cursor = dragging ? "grabbing" : "grab";
+      }}
+      onClick={(e) => {
+        // Stop the click from bubbling through to the underlying roof —
+        // otherwise free-placement mode would aim at the panel and the user
+        // would inadvertently pile a new panel on top of this one.
+        e.stopPropagation();
+        onToggleSelect(data.id);
       }}
     >
       <primitive object={clonedScene} />
@@ -807,7 +946,7 @@ function SceneContent({
   hoverPose,
   previewYawRad,
   onSnapHover,
-  onSnapPlace,
+  onSnapAim,
 }: {
   model: THREE.Object3D | null;
   panels: PanelData[];
@@ -833,7 +972,8 @@ function SceneContent({
   hoverPose: SnapPose | null;
   previewYawRad: number;
   onSnapHover: (pose: SnapPose | null) => void;
-  onSnapPlace: (pose: SnapPose) => void;
+  /** Aiming = updating the locked target without committing a panel. */
+  onSnapAim: (pose: SnapPose) => void;
 }) {
   const { camera } = useThree();
   const modelGridOriginRef = useRef<[number, number, number]>([0, 0, 0]);
@@ -903,7 +1043,7 @@ function SceneContent({
           object={model}
           snap={
             freePlacementMode
-              ? { yawRad: previewYawRad, onHover: onSnapHover, onPlace: onSnapPlace }
+              ? { yawRad: previewYawRad, onHover: onSnapHover, onAim: onSnapAim }
               : undefined
           }
         />
@@ -1055,7 +1195,19 @@ export default function SolarViewer() {
   const [recommendation, setRecommendation] = useState<DesignFromPromptResponse | null>(null);
   const [freePlacementMode, setFreePlacementMode] = useState(false);
   const [hoverPose, setHoverPose] = useState<SnapPose | null>(null);
+  // Last seen hover pose — survives onPointerOut so the Propose button stays
+  // clickable after you move the cursor off the canvas toward the sidebar.
+  const [lastHoverPose, setLastHoverPose] = useState<SnapPose | null>(null);
   const [previewYawDeg, setPreviewYawDeg] = useState(0);
+  // Estimated capacity of the roof patch around `lastHoverPose`, computed by
+  // running a generous flood-fill against the BVH. null until measured.
+  const [roofCapacity, setRoofCapacity] = useState<{
+    count: number;
+    /** Roof patch area available for placement (panel footprint + gap, ×count). */
+    roofArea: number;
+    /** Sum of panel footprints — what the panels themselves occupy. */
+    panelCoverage: number;
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addingMoreRef = useRef(false);
 
@@ -1078,61 +1230,132 @@ export default function SolarViewer() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // Commit a permanent panel from a hover pose — used by the BVH snap handler.
-  const placeFromSnap = useCallback((pose: SnapPose) => {
+  // Aim handler: a click on the model just locks the target without placing.
+  // Lets the user nudge / rotate / verify the preview before pressing Confirm.
+  const aimAtPose = useCallback((pose: SnapPose) => {
+    setLastHoverPose(pose);
+  }, []);
+
+  // Commit a panel at the current locked target. Wired to the Confirm button
+  // and to the Enter key while free-placement mode is active.
+  const commitPlacement = useCallback(() => {
+    if (!lastHoverPose) return;
+    const pose = lastHoverPose;
+    const modelKey = pickPanelModel(new THREE.Vector3(...pose.worldNormal));
+    const def = PANEL_MODELS[modelKey];
     setPanels((prev) => [
       ...prev,
       {
         id: crypto.randomUUID(),
         position: pose.position,
         quaternion: pose.quaternion,
-        width: PANEL_W,
-        height: PANEL_H,
-        depth: 0.18,
+        width: def.width,
+        height: def.height,
+        depth: def.depth,
+        modelKey,
       },
     ]);
-  }, []);
+  }, [lastHoverPose]);
 
   // Auto-layout: uses the current hover pose as the seed and grows a parallel
   // panel grid outward, sampling the BVH to skip non-roof cells. Replaces the
   // current panel set so the user can iterate on different seed points.
+  // Helper: run the flood-fill once and convert poses into PanelData with the
+  // right per-cell model. Returns the data plus a capacity summary.
+  //
+  // Gating chosen to stick to the seed's roof patch:
+  //   - maxNormalDeg 12°    → won't bleed onto a neighbouring slope or wall
+  //   - maxPlaneOffset 0.5m → handles photogrammetry noise but rejects ground
+  //   - maxJump derived from cell step (auto), so legit neighbours always pass
+  const buildLayoutFromSeed = useCallback(
+    (seed: SnapPose, panelLimit: number, modelRoot: THREE.Object3D) => {
+      const gap = 0.2;
+      const cellArea = (PANEL_MODELS.flat.width + gap) * (PANEL_MODELS.flat.height + gap);
+      const poses = proposeLayout(seed, panelLimit, modelRoot, {
+        gap,
+        maxNormalDeg: 12,
+        maxPlaneOffset: 0.5,
+        // maxJump intentionally omitted — proposeLayout defaults it from the cell step.
+      });
+      let panelCoverage = 0; // sum of panel footprints (real solar area)
+      const data = poses.map<PanelData>((pose) => {
+        const modelKey = pickPanelModel(new THREE.Vector3(...pose.worldNormal));
+        const def = PANEL_MODELS[modelKey];
+        panelCoverage += def.width * def.height;
+        return {
+          id: crypto.randomUUID(),
+          position: pose.position,
+          quaternion: pose.quaternion,
+          width: def.width,
+          height: def.height,
+          depth: def.depth,
+          modelKey,
+        };
+      });
+      return {
+        data,
+        count: poses.length,
+        // Roof patch area available for placement: each cell occupies its full
+        // step (panel + gap), and that's the chunk of roof reserved per panel.
+        roofArea: poses.length * cellArea,
+        // What the panels actually cover (excluding gaps).
+        panelCoverage,
+      };
+    },
+    [],
+  );
+
+  // Measure: flood-fill with a generous cap (1000 panels) so we know how many
+  // would fit on this roof patch from the chosen seed. Cached so the user can
+  // see remaining capacity as they place panels.
+  const measureRoof = useCallback(() => {
+    if (!model) return;
+    if (!lastHoverPose) {
+      setError("Hover over the roof first, then press Measure.");
+      return;
+    }
+    const { count, roofArea, panelCoverage } = buildLayoutFromSeed(lastHoverPose, 1000, model);
+    if (count === 0) {
+      setError("Couldn't find any panel slots from that point. Try a flatter spot on the roof.");
+      setRoofCapacity(null);
+      return;
+    }
+    setRoofCapacity({ count, roofArea, panelCoverage });
+    setError(null);
+  }, [model, lastHoverPose, buildLayoutFromSeed]);
+
   const proposeDesign = useCallback(() => {
     if (!model || !recommendation) {
       setError("Load a model and run a prompt first.");
       return;
     }
-    if (!hoverPose) {
+    if (!lastHoverPose) {
       setError("Hover over the roof in free-placement mode, then press Propose.");
       return;
     }
     const target = recommendation.design.panels_needed;
-    const layout = proposeLayout(hoverPose, target, model, {
-      gap: 0.2,
-      maxNormalDeg: 25,
-    });
-    if (layout.length === 0) {
+    // Run a generous fill first (so we learn capacity), then keep the closest N.
+    const full = buildLayoutFromSeed(lastHoverPose, 1000, model);
+    if (full.count === 0) {
       setError("Couldn't fit panels around that point. Try a flatter spot on the roof.");
       return;
     }
-    setPanels(
-      layout.map((pose) => ({
-        id: crypto.randomUUID(),
-        position: pose.position,
-        quaternion: pose.quaternion,
-        width: PANEL_W,
-        height: PANEL_H,
-        depth: 0.18,
-      })),
-    );
+    setRoofCapacity({
+      count: full.count,
+      roofArea: full.roofArea,
+      panelCoverage: full.panelCoverage,
+    });
+    const placed = full.data.slice(0, target);
+    setPanels(placed);
     setError(
-      layout.length < target
-        ? `Placed ${layout.length} of ${target} — surface ran out around the seed.`
+      placed.length < target
+        ? `Roof fits ${full.count} panels here — placed ${placed.length} of the ${target} target.`
         : null,
     );
-  }, [model, recommendation, hoverPose]);
+  }, [model, recommendation, lastHoverPose, buildLayoutFromSeed]);
 
-  // Q / E rotate the preview yaw by ±15°, R resets to 0. Active only while
-  // free-placement mode is on. Doesn't fire when an input/textarea has focus.
+  // Q / E rotate preview yaw, R resets, Enter commits at the locked target.
+  // Only fires in free-placement mode; ignored when typing in an input.
   useEffect(() => {
     if (!freePlacementMode) return;
     const onKey = (event: KeyboardEvent) => {
@@ -1148,11 +1371,14 @@ export default function SolarViewer() {
       } else if (k === "r") {
         event.preventDefault();
         setPreviewYawDeg(0);
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        commitPlacement();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [freePlacementMode]);
+  }, [freePlacementMode, commitPlacement]);
 
   const snapHeightOffset = useCallback((value: number) => {
     const maxHeight = GRID_SIZE / 2;
@@ -1202,6 +1428,8 @@ export default function SolarViewer() {
     setSelectedSlots(new Set());
     setFreePlacementMode(false);
     setHoverPose(null);
+    setLastHoverPose(null);
+    setRoofCapacity(null);
     try {
       const arrayBuffer = await file.arrayBuffer();
       const gltf = await gltfLoader.parseAsync(arrayBuffer, "");
@@ -1412,11 +1640,24 @@ export default function SolarViewer() {
   }, []);
 
   const stats = useMemo(() => {
-    const area = panels.reduce((s, p) => s + p.width * p.height, 0);
+    // Bucket placed panels by model so the sidebar can show truthful
+    // count / area / cost per type — flat and slanted carry different prices.
+    const byModel: Record<PanelModelKey, { count: number; area: number; cost: number }> = {
+      flat: { count: 0, area: 0, cost: 0 },
+      slanted: { count: 0, area: 0, cost: 0 },
+    };
+    for (const p of panels) {
+      const key = p.modelKey ?? "flat";
+      const def = PANEL_MODELS[key];
+      byModel[key].count += 1;
+      byModel[key].area += p.width * p.height;
+      byModel[key].cost += def.pricePerUnit;
+    }
     return {
       count: panels.length,
-      area,
-      cost: panels.length * COST_PER_PANEL,
+      area: byModel.flat.area + byModel.slanted.area,
+      cost: byModel.flat.cost + byModel.slanted.cost,
+      byModel,
     };
   }, [panels]);
 
@@ -1466,8 +1707,11 @@ export default function SolarViewer() {
               freePlacementMode={freePlacementMode}
               hoverPose={hoverPose}
               previewYawRad={THREE.MathUtils.degToRad(previewYawDeg)}
-              onSnapHover={setHoverPose}
-              onSnapPlace={placeFromSnap}
+              onSnapHover={(p) => {
+                setHoverPose(p);
+                if (p) setLastHoverPose(p);
+              }}
+              onSnapAim={aimAtPose}
             />
           </Suspense>
         </Canvas>
@@ -1840,6 +2084,8 @@ export default function SolarViewer() {
             onClick={() => {
               setFreePlacementMode((v) => !v);
               setHoverPose(null);
+              setLastHoverPose(null);
+              setRoofCapacity(null);
               setPreviewYawDeg(0);
             }}
             disabled={!model || loading}
@@ -1850,7 +2096,10 @@ export default function SolarViewer() {
 
           {freePlacementMode && (
             <p className="rounded-md border border-border bg-background/50 px-3 py-2 text-[11px] text-muted-foreground">
-              <span className="font-medium text-foreground">Q / E</span> rotate preview ±15°,
+              Hover or click on the roof to aim, then press{" "}
+              <span className="font-medium text-foreground">Enter</span> or
+              {" "}<span className="font-medium text-foreground">Confirm</span> to drop a panel.
+              {" "}<span className="font-medium text-foreground">Q / E</span> rotate ±15°,
               {" "}<span className="font-medium text-foreground">R</span> reset.
               Drag a placed panel; hold it and use{" "}
               <span className="font-medium text-foreground">←/→</span> to rotate,{" "}
@@ -1860,11 +2109,35 @@ export default function SolarViewer() {
             </p>
           )}
 
+          {freePlacementMode && (
+            <Button
+              variant="default"
+              className="w-full"
+              onClick={commitPlacement}
+              disabled={!model || loading || !lastHoverPose}
+            >
+              <Sun className="mr-2 h-4 w-4" />
+              Confirm placement (Enter)
+            </Button>
+          )}
+
+          <Button
+            variant="outline"
+            className="w-full"
+            onClick={measureRoof}
+            disabled={!model || loading || !lastHoverPose}
+          >
+            <Ruler className="mr-2 h-4 w-4" />
+            {roofCapacity
+              ? `Roof patch: ${roofCapacity.count} panels · ${roofCapacity.roofArea.toFixed(1)} m²`
+              : "Measure roof from this spot"}
+          </Button>
+
           <Button
             variant="secondary"
             className="w-full"
             onClick={proposeDesign}
-            disabled={!model || loading || !recommendation || !hoverPose}
+            disabled={!model || loading || !recommendation || !lastHoverPose}
           >
             <Sparkles className="mr-2 h-4 w-4" />
             Propose a design ({recommendation?.design.panels_needed ?? "?"} panels)
@@ -1921,16 +2194,103 @@ export default function SolarViewer() {
           )}
           <StatRow
             icon={<Ruler className="h-4 w-4" />}
-            label="Selected roof area"
+            label="Covered roof area"
             value={`${stats.area.toFixed(2)} m²`}
           />
+
+          {(stats.byModel.flat.count > 0 || stats.byModel.slanted.count > 0) && (
+            <div className="rounded-md border border-border bg-background/50 px-4 py-3 text-xs">
+              <p className="mb-2 text-muted-foreground">By panel type</p>
+              <div className="space-y-1.5">
+                {(["flat", "slanted"] as const).map((k) => {
+                  const b = stats.byModel[k];
+                  if (b.count === 0) return null;
+                  const def = PANEL_MODELS[k];
+                  const perPanelArea = def.width * def.height;
+                  return (
+                    <div key={k} className="space-y-0.5">
+                      <div className="flex items-center justify-between">
+                        <span className="flex items-center gap-2">
+                          <span
+                            className="inline-block h-2 w-2 rounded-full"
+                            style={{ backgroundColor: def.color }}
+                          />
+                          <span className="text-foreground">{def.label}</span>
+                        </span>
+                        <span className="font-mono tabular-nums text-foreground">
+                          {b.count}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between pl-4 text-[11px] text-muted-foreground">
+                        <span>
+                          {def.width}×{def.height} m → {perPanelArea.toFixed(2)} m²/panel
+                        </span>
+                        <span className="font-mono tabular-nums">
+                          € {def.pricePerUnit.toLocaleString("de-DE")}/each
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between pl-4 text-[11px]">
+                        <span className="text-muted-foreground">subtotal</span>
+                        <span className="font-mono tabular-nums">
+                          {b.area.toFixed(2)} m² · € {b.cost.toLocaleString("de-DE")}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {roofCapacity && (
+            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-4 py-3 text-xs">
+              <p className="mb-1 text-muted-foreground">Roof patch (from seed)</p>
+              <div className="flex items-center justify-between font-mono tabular-nums">
+                <span className="text-muted-foreground">available</span>
+                <span className="font-semibold text-foreground">
+                  {roofCapacity.count} slots · {roofCapacity.roofArea.toFixed(1)} m²
+                </span>
+              </div>
+              <div className="pl-4 text-[10px] text-muted-foreground">
+                ↳ panels would cover {roofCapacity.panelCoverage.toFixed(1)} m² (the
+                rest is gaps between panels)
+              </div>
+              <div className="mt-1 flex items-center justify-between font-mono tabular-nums">
+                <span className="text-muted-foreground">placed</span>
+                <span className="text-foreground">
+                  {stats.count} · {stats.area.toFixed(1)} m² covered
+                </span>
+              </div>
+              <div className="flex items-center justify-between font-mono tabular-nums">
+                <span className="text-muted-foreground">remaining slots</span>
+                <span
+                  className={cn(
+                    "font-semibold",
+                    Math.max(0, roofCapacity.count - stats.count) === 0
+                      ? "text-emerald-500"
+                      : "text-amber-500",
+                  )}
+                >
+                  {Math.max(0, roofCapacity.count - stats.count)} ·{" "}
+                  {Math.max(0, roofCapacity.roofArea - (roofCapacity.roofArea / roofCapacity.count) * stats.count).toFixed(1)} m²
+                </span>
+              </div>
+            </div>
+          )}
+
           <StatRow
             icon={<Euro className="h-4 w-4" />}
-            label={recommendation ? "ML cost estimate" : "Estimated cost"}
-            value={`€ ${(recommendation
+            label={
+              recommendation && stats.count === 0
+                ? "ML cost estimate"
+                : "Live placement cost"
+            }
+            value={`€ ${(recommendation && stats.count === 0
               ? recommendation.design.estimated_total_cost_euros
-              : stats.cost
-            ).toLocaleString("de-DE")}`}
+              : (recommendation
+                  ? recommendation.design.recommended_battery_kwh * PRICE_PER_KWH_BATTERY
+                  : 0) + stats.cost
+            ).toLocaleString("de-DE", { maximumFractionDigits: 0 })}`}
             highlight
           />
         </div>
