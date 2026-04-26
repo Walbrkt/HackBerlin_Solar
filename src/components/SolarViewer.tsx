@@ -50,31 +50,83 @@ function ModelMesh({ object }: { object: THREE.Object3D }) {
 
 function Panel({
   data,
-  onRemove,
+  onMove,
+  onHoldingChange,
 }: {
   data: PanelData;
-  onRemove: (id: string) => void;
+  onMove: (id: string, position: [number, number, number]) => void;
+  onHoldingChange: (id: string | null) => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const dragPlaneRef = useRef(new THREE.Plane());
+  const dragOffsetRef = useRef(new THREE.Vector3());
+  const intersectionRef = useRef(new THREE.Vector3());
   const boxThickness = data.depth ?? (hovered ? 0.42 : 0.28);
+
+  const startHolding = useCallback((e: any) => {
+    e.stopPropagation();
+    if (e.target && typeof e.target.setPointerCapture === "function") {
+      e.target.setPointerCapture(e.pointerId);
+    }
+    const plane = dragPlaneRef.current;
+    plane.set(new THREE.Vector3(0, 0, 1), -data.position[2]);
+    const hit = e.ray.intersectPlane(plane, intersectionRef.current);
+    if (hit) {
+      dragOffsetRef.current.set(
+        data.position[0] - hit.x,
+        data.position[1] - hit.y,
+        0,
+      );
+    } else {
+      dragOffsetRef.current.set(0, 0, 0);
+    }
+    setDragging(true);
+    onHoldingChange(data.id);
+    document.body.style.cursor = "grabbing";
+  }, [data.id, data.position, onHoldingChange]);
+
+  const stopHolding = useCallback((e?: any) => {
+    if (e?.target && typeof e.target.releasePointerCapture === "function") {
+      try {
+        e.target.releasePointerCapture(e.pointerId);
+      } catch {
+        // No-op: capture might already be released.
+      }
+    }
+    setDragging(false);
+    onHoldingChange(null);
+    document.body.style.cursor = hovered ? "grab" : "auto";
+  }, [hovered, onHoldingChange]);
+
   return (
     <mesh
       position={data.position}
       quaternion={data.quaternion}
       castShadow
       receiveShadow
-      onClick={(e) => {
+      onPointerDown={startHolding}
+      onPointerUp={(e) => stopHolding(e)}
+      onPointerCancel={(e) => stopHolding(e)}
+      onPointerOut={() => {
+        setHovered(false);
+        if (!dragging) document.body.style.cursor = "auto";
+      }}
+      onPointerMove={(e) => {
+        if (!dragging) return;
         e.stopPropagation();
-        onRemove(data.id);
+        const hit = e.ray.intersectPlane(dragPlaneRef.current, intersectionRef.current);
+        if (!hit) return;
+        onMove(data.id, [
+          hit.x + dragOffsetRef.current.x,
+          hit.y + dragOffsetRef.current.y,
+          data.position[2],
+        ]);
       }}
       onPointerOver={(e) => {
         e.stopPropagation();
         setHovered(true);
-        document.body.style.cursor = "pointer";
-      }}
-      onPointerOut={() => {
-        setHovered(false);
-        document.body.style.cursor = "auto";
+        document.body.style.cursor = dragging ? "grabbing" : "grab";
       }}
     >
       <boxGeometry args={[data.width, data.height, boxThickness]} />
@@ -263,6 +315,35 @@ function CoordinateGrid({
   );
 }
 
+// Red translucent plane used to preview the current selection height.
+function SelectionHeightPlane({
+  size = GRID_SIZE,
+  center,
+  rotationZDeg,
+  heightOffset,
+}: {
+  size?: number;
+  center: [number, number, number];
+  rotationZDeg: number;
+  heightOffset: number;
+}) {
+  return (
+    <mesh
+      position={[center[0], center[1], center[2] + heightOffset + 0.02]}
+      rotation={[0, 0, (rotationZDeg * Math.PI) / 180]}
+    >
+      <planeGeometry args={[size, size]} />
+      <meshBasicMaterial
+        color="hsl(0, 100%, 55%)"
+        transparent
+        opacity={0.18}
+        side={THREE.DoubleSide}
+        depthWrite={false}
+      />
+    </mesh>
+  );
+}
+
 // A single clickable cell tile for the manual selection layer
 function SelectableGridCell({
   col,
@@ -415,6 +496,7 @@ function SceneContent({
   model,
   panels,
   onRemovePanel,
+  onMovePanel,
   highlights,
   pickingSlots,
   selectedSlots,
@@ -431,6 +513,7 @@ function SceneContent({
   model: THREE.Object3D | null;
   panels: PanelData[];
   onRemovePanel: (id: string) => void;
+  onMovePanel: (id: string, position: [number, number, number]) => void;
   highlights: Candidate[];
   pickingSlots: PanelData[] | null;
   selectedSlots: Set<string>;
@@ -446,6 +529,7 @@ function SceneContent({
 }) {
   const { camera } = useThree();
   const modelGridOriginRef = useRef<[number, number, number]>([0, 0, 0]);
+  const [heldPanelId, setHeldPanelId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!model) return;
@@ -466,6 +550,41 @@ function SceneContent({
     modelGridOriginRef.current[2],
   ];
 
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!heldPanelId) return;
+      const active = panels.find((p) => p.id === heldPanelId);
+      if (!active) return;
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        onMovePanel(heldPanelId, [
+          active.position[0],
+          active.position[1],
+          active.position[2] + 0.1,
+        ]);
+      }
+
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        onMovePanel(heldPanelId, [
+          active.position[0],
+          active.position[1],
+          active.position[2] - 0.1,
+        ]);
+      }
+
+      if (event.key === "Backspace") {
+        event.preventDefault();
+        onRemovePanel(heldPanelId);
+        setHeldPanelId(null);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [heldPanelId, onMovePanel, onRemovePanel, panels]);
+
   return (
     <>
       <ambientLight intensity={0.6} />
@@ -474,7 +593,12 @@ function SceneContent({
       <Environment preset="city" />
       {model && <ModelMesh object={model} />}
       {panels.map((p) => (
-        <Panel key={p.id} data={p} onRemove={onRemovePanel} />
+        <Panel
+          key={p.id}
+          data={p}
+          onMove={onMovePanel}
+          onHoldingChange={setHeldPanelId}
+        />
       ))}
       {highlights.map((c) => (
         <RoofHighlight key={c.id} candidate={c} />
@@ -488,12 +612,20 @@ function SceneContent({
         />
       ))}
       {showCoordinateGrid && (
-        <CoordinateGrid
-          size={150}
-          divisions={25}
-          center={gridCenter}
-          rotationZDeg={gridRotationZDeg}
-        />
+        <>
+          <CoordinateGrid
+            size={150}
+            divisions={25}
+            center={gridCenter}
+            rotationZDeg={gridRotationZDeg}
+          />
+          <SelectionHeightPlane
+            size={150}
+            center={gridCenter}
+            rotationZDeg={gridRotationZDeg}
+            heightOffset={gridHeightOffset}
+          />
+        </>
       )}
       {gridSelectionMode && (
         <SelectableGridLayer
@@ -513,7 +645,7 @@ function SceneContent({
           infiniteGrid
         />
       )}
-      <OrbitControls makeDefault enableDamping />
+      <OrbitControls makeDefault enableDamping enabled={!heldPanelId} />
     </>
   );
 }
@@ -798,6 +930,10 @@ export default function SolarViewer() {
     setPanels((prev) => prev.filter((p) => p.id !== id));
   }, []);
 
+  const movePanel = useCallback((id: string, position: [number, number, number]) => {
+    setPanels((prev) => prev.map((panel) => (panel.id === id ? { ...panel, position } : panel)));
+  }, []);
+
   const clearPanels = useCallback(() => {
     setPanels([]);
     setHighlights([]);
@@ -844,6 +980,7 @@ export default function SolarViewer() {
               model={model}
               panels={panels}
               onRemovePanel={removePanel}
+              onMovePanel={movePanel}
               highlights={showHighlights ? highlights : []}
               pickingSlots={pickingSlots}
               selectedSlots={selectedSlots}
@@ -918,6 +1055,16 @@ export default function SolarViewer() {
         {error && (
           <div className="absolute bottom-4 left-1/2 -translate-x-1/2 rounded-md bg-destructive px-4 py-2 text-sm text-destructive-foreground shadow">
             {error}
+          </div>
+        )}
+
+        {panels.length > 0 && (
+          <div className="pointer-events-none absolute right-4 top-4 max-w-xs rounded-md border border-border bg-card/90 p-3 text-xs shadow-lg backdrop-blur">
+            <p className="mb-1 font-semibold text-foreground">Panel controls</p>
+            <p className="text-muted-foreground">
+              Click and drag a panel to move on X/Y. While holding it, press Arrow Up or Arrow
+              Down to move on Z. While holding it, press Backspace to delete.
+            </p>
           </div>
         )}
       </div>
@@ -1162,6 +1309,7 @@ export default function SolarViewer() {
                 disabled={!model || loading}
                 onClick={() => {
                   setGridConfigured(true);
+                  setShowCoordinateGrid(false);
                   setGridSelectionMode(false);
                   setError(null);
                 }}
@@ -1235,8 +1383,8 @@ export default function SolarViewer() {
           <p className="mb-1 font-medium text-foreground">Tip</p>
           Show the coordinate grid, align it to your roof (pan, rotate, height), then
           click "Set Grid". After that, use "Place Solar Panels" to mark which cells are on
-          the roof surface, then click Confirm to place panels immediately.
-          Click any placed panel to remove it.
+          the roof surface, then click Confirm to place panels immediately. Drag placed panels
+          to reposition them.
         </div>
       </aside>
 
