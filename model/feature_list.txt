@@ -1,0 +1,8 @@
+total_estimated_demand_kwh
+energy_demand_wh
+has_ev
+has_solar
+has_storage
+has_wallbox
+house_size_sqm
+heating_existing_electricity_demand_kwh

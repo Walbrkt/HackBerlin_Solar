@@ -16,8 +16,11 @@ gltfLoader.setDRACOLoader(dracoLoader);
 gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3, Sparkles } from "lucide-react";
+import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3, Sparkles, Battery, Target } from "lucide-react";
 import { cn } from "@/lib/utils";
+import DesignFromPrompt, {
+  type DesignFromPromptResponse,
+} from "@/components/DesignFromPrompt";
 
 const COST_PER_PANEL = 250;
 const PANEL_W = 1.0;
@@ -733,6 +736,7 @@ export default function SolarViewer() {
   const [modelCenterXY, setModelCenterXY] = useState<[number, number]>([0, 0]);
   const [gridSelectionMode, setGridSelectionMode] = useState(false);
   const [selectedGridCells, setSelectedGridCells] = useState<Set<string>>(new Set());
+  const [recommendation, setRecommendation] = useState<DesignFromPromptResponse | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const snapHeightOffset = useCallback((value: number) => {
@@ -1070,7 +1074,7 @@ export default function SolarViewer() {
       </div>
 
       {/* Sidebar */}
-      <aside className="flex w-80 flex-col border-l border-border bg-card">
+      <aside className="flex w-80 flex-col overflow-y-auto border-l border-border bg-card">
         <div className="border-b border-border p-5">
           <h1 className="flex items-center gap-2 text-xl font-bold">
             <Sun className="h-5 w-5 text-primary" />
@@ -1079,6 +1083,10 @@ export default function SolarViewer() {
           <p className="mt-1 text-sm text-muted-foreground">
             Plan rooftop solar installations on any 3D model.
           </p>
+        </div>
+
+        <div className="border-b border-border p-5">
+          <DesignFromPrompt onResult={setRecommendation} />
         </div>
 
         <div className="space-y-3 p-5">
@@ -1363,9 +1371,27 @@ export default function SolarViewer() {
         <div className="space-y-3 px-5">
           <StatRow
             icon={<Grid3x3 className="h-4 w-4" />}
-            label="Panels"
-            value={stats.count.toString()}
+            label="Panels placed"
+            value={
+              recommendation
+                ? `${stats.count} / ${recommendation.design.panels_needed}`
+                : stats.count.toString()
+            }
           />
+          {recommendation && (
+            <>
+              <StatRow
+                icon={<Target className="h-4 w-4" />}
+                label="Target roof area"
+                value={`${recommendation.design.roof_space_sqm_needed.toFixed(1)} m²`}
+              />
+              <StatRow
+                icon={<Battery className="h-4 w-4" />}
+                label="Recommended battery"
+                value={`${recommendation.design.recommended_battery_kwh} kWh`}
+              />
+            </>
+          )}
           <StatRow
             icon={<Ruler className="h-4 w-4" />}
             label="Selected roof area"
@@ -1373,8 +1399,11 @@ export default function SolarViewer() {
           />
           <StatRow
             icon={<Euro className="h-4 w-4" />}
-            label="Estimated cost"
-            value={`€ ${stats.cost.toLocaleString("de-DE")}`}
+            label={recommendation ? "ML cost estimate" : "Estimated cost"}
+            value={`€ ${(recommendation
+              ? recommendation.design.estimated_total_cost_euros
+              : stats.cost
+            ).toLocaleString("de-DE")}`}
             highlight
           />
         </div>

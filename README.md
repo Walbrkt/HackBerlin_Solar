@@ -14,9 +14,11 @@ src/
   process_project_options.py     Phase 1: extract Y targets per project_id
   prepare_training_data.py       Phase 2: clean X features, merge with Y
   train_model.py                 Phase 3: train + evaluate + save artifacts
-  inference_server.py            FastAPI server (structured + prompt endpoints)
+  inference_server.py            FastAPI server (structured + prompt endpoints, serves UI)
   feature_extractor.py           Free-text → CustomerFeatures via Gemini (response_schema)
   test_inference_server.py       Client test suite (3 customer profiles)
+web/
+  index.html                     Single-page UI (vanilla HTML/CSS/JS, no build step)
 ```
 
 Detailed docs: [PROJECT_COMPLETION.md](PROJECT_COMPLETION.md),
@@ -30,16 +32,64 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run the API
+## Run the full stack
 
-The trained model is committed under [model/](model/), so the server runs
-straight after install:
+The project ships two frontends:
+
+- **React + Vite + react-three-fiber app** (primary) — drop a `.glb` model,
+  describe your household in plain text, and the ML recommendation drives the
+  3D panel-placement workflow. This is what `npm run dev` boots.
+- **Tiny static HTML page** at `/web/` (fallback) — no build step, served
+  straight from FastAPI, useful when you don't want to run Node.
+
+### Dev workflow (recommended)
+
+Run **both** servers in two terminals:
 
 ```bash
+# Terminal 1 — backend (FastAPI on :8000)
+set -a; . .env; set +a   # loads GEMINI_API_KEY (optional — see below)
 python src/inference_server.py
-# Server: http://localhost:8000
-# Swagger UI: http://localhost:8000/docs
+
+# Terminal 2 — frontend (Vite on :8080, proxies /api/* to :8000)
+npm install              # first time only
+npm run dev
 ```
+
+Open <http://localhost:8080/>. The Vite dev server proxies `/api/*` to
+FastAPI, so the React app and the backend share the same origin.
+
+### What the UI does
+
+1. **Drop a `.glb`** rooftop model into the canvas (or click "Choose .glb").
+2. **Describe the household** in the "Design from a prompt" panel
+   (e.g. *"180 sqm house, two EVs, ~7 MWh/year, no solar yet"*) and hit
+   "Design my system".
+3. The recommendation lands in the sidebar: target panel count, target
+   roof area, recommended battery, and ML cost estimate. Each input shows
+   an `extracted` (Gemini), `regex` (fallback parser), or `defaulted`
+   badge so you can see what was inferred.
+4. Configure the coordinate grid on the rooftop, then click
+   "Place Solar Panels" — the "Panels placed" stat tracks `X / target`
+   so you can stop at the recommended number.
+
+### Feature extraction: Gemini → regex fallback
+
+`POST /api/design-system/from-prompt` runs the user's text through:
+
+1. **Google Gemini** (`gemini-2.5-flash`, structured output via
+   `response_schema=PartialCustomerFeatures`) — when `GEMINI_API_KEY` (or
+   `GOOGLE_API_KEY`) is set in the server environment.
+2. **Regex/keyword fallback** ([src/feature_extractor.py:_regex_extract](src/feature_extractor.py)) —
+   when no key is configured **or** Gemini fails (network, rate limit, etc.).
+   Recognizes Wh/kWh/MWh, m²/sqm/sqft, "EV"/"wallbox"/"solar"/"battery",
+   negation ("no EV"), and "EV charging at home" → wallbox=1.
+
+Either path yields the same response shape, with a per-field `provenance`
+of `extracted`, `regex`, or `defaulted`.
+
+Get a free Gemini key at <https://aistudio.google.com/app/apikey>; drop it
+into a `.env` (already gitignored) as `GEMINI_API_KEY=...`.
 
 Smoke-test it from another shell:
 
