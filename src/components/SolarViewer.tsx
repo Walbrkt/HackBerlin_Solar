@@ -16,11 +16,30 @@ gltfLoader.setDRACOLoader(dracoLoader);
 gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3, Sparkles, Battery, Target } from "lucide-react";
+import {
+  Upload,
+  Sun,
+  Trash2,
+  Euro,
+  Ruler,
+  Grid3x3,
+  Sparkles,
+  Battery,
+  Target,
+  MousePointerClick,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import DesignFromPrompt, {
   type DesignFromPromptResponse,
 } from "@/components/DesignFromPrompt";
+import PlacementHUD from "@/components/PlacementHUD";
+import { indexModelForBVH } from "@/lib/bvh-setup";
+
+// €/panel and €/kWh used for the live HUD; mirrors backend constants.
+const PRICE_PER_PANEL = 1500;
+const PRICE_PER_KWH_BATTERY = 800;
+// Local "out" axis of the BoxGeometry-based panel preview (Z is the thin axis).
+const PANEL_LOCAL_NORMAL = new THREE.Vector3(0, 0, 1);
 
 const COST_PER_PANEL = 250;
 const PANEL_W = 1.0;
@@ -47,8 +66,80 @@ type Candidate = {
   height: number;
 };
 
-function ModelMesh({ object }: { object: THREE.Object3D }) {
-  return <primitive object={object} />;
+type SnapPose = {
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+};
+
+// Renders the loaded model. When `snap` props are provided, attaches pointer
+// handlers so hovering over the surface emits a BVH-accelerated snap pose and
+// clicking commits a permanent panel.
+function ModelMesh({
+  object,
+  snap,
+}: {
+  object: THREE.Object3D;
+  snap?: {
+    onHover: (pose: SnapPose | null) => void;
+    onPlace: (pose: SnapPose) => void;
+  };
+}) {
+  // Reusable scratch — created once, reused on every pointermove.
+  const tmpQuatRef = useRef(new THREE.Quaternion());
+  const tmpNormalRef = useRef(new THREE.Vector3());
+
+  const poseFromEvent = useCallback((e: any): SnapPose | null => {
+    if (!e.face) return null;
+    // face.normal is in the hit object's LOCAL space — promote to world.
+    tmpNormalRef.current
+      .copy(e.face.normal)
+      .transformDirection(e.object.matrixWorld)
+      .normalize();
+    tmpQuatRef.current.setFromUnitVectors(PANEL_LOCAL_NORMAL, tmpNormalRef.current);
+    const q = tmpQuatRef.current;
+    return {
+      position: [e.point.x, e.point.y, e.point.z],
+      quaternion: [q.x, q.y, q.z, q.w],
+    };
+  }, []);
+
+  if (!snap) return <primitive object={object} />;
+
+  return (
+    <primitive
+      object={object}
+      onPointerMove={(e: any) => {
+        e.stopPropagation();
+        const pose = poseFromEvent(e);
+        if (pose) snap.onHover(pose);
+      }}
+      onPointerOut={() => snap.onHover(null)}
+      onClick={(e: any) => {
+        // onClick fires only on a non-dragged left click — leaves drag-to-rotate intact.
+        if (e.button !== 0) return;
+        e.stopPropagation();
+        const pose = poseFromEvent(e);
+        if (pose) snap.onPlace(pose);
+      }}
+    />
+  );
+}
+
+// Translucent preview rendered at the cursor in free-placement mode.
+function PreviewPanel({ pose }: { pose: SnapPose }) {
+  return (
+    <mesh position={pose.position} quaternion={pose.quaternion}>
+      <boxGeometry args={[PANEL_W, PANEL_H, 0.18]} />
+      <meshStandardMaterial
+        color="hsl(140, 100%, 55%)"
+        emissive="hsl(140, 100%, 35%)"
+        emissiveIntensity={0.7}
+        transparent
+        opacity={0.55}
+        depthWrite={false}
+      />
+    </mesh>
+  );
 }
 
 function Panel({
@@ -512,6 +603,10 @@ function SceneContent({
   gridSelectionMode,
   selectedGridCells,
   onToggleGridCell,
+  freePlacementMode,
+  hoverPose,
+  onSnapHover,
+  onSnapPlace,
 }: {
   model: THREE.Object3D | null;
   panels: PanelData[];
@@ -529,6 +624,10 @@ function SceneContent({
   gridSelectionMode: boolean;
   selectedGridCells: Set<string>;
   onToggleGridCell: (key: string) => void;
+  freePlacementMode: boolean;
+  hoverPose: SnapPose | null;
+  onSnapHover: (pose: SnapPose | null) => void;
+  onSnapPlace: (pose: SnapPose) => void;
 }) {
   const { camera } = useThree();
   const modelGridOriginRef = useRef<[number, number, number]>([0, 0, 0]);
@@ -594,7 +693,17 @@ function SceneContent({
       <directionalLight position={[10, 20, 10]} intensity={1.2} castShadow />
       <directionalLight position={[-10, 10, -10]} intensity={0.4} />
       <Environment preset="city" />
-      {model && <ModelMesh object={model} />}
+      {model && (
+        <ModelMesh
+          object={model}
+          snap={
+            freePlacementMode
+              ? { onHover: onSnapHover, onPlace: onSnapPlace }
+              : undefined
+          }
+        />
+      )}
+      {freePlacementMode && hoverPose && <PreviewPanel pose={hoverPose} />}
       {panels.map((p) => (
         <Panel
           key={p.id}
@@ -737,7 +846,24 @@ export default function SolarViewer() {
   const [gridSelectionMode, setGridSelectionMode] = useState(false);
   const [selectedGridCells, setSelectedGridCells] = useState<Set<string>>(new Set());
   const [recommendation, setRecommendation] = useState<DesignFromPromptResponse | null>(null);
+  const [freePlacementMode, setFreePlacementMode] = useState(false);
+  const [hoverPose, setHoverPose] = useState<SnapPose | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Commit a permanent panel from a hover pose — used by the BVH snap handler.
+  const placeFromSnap = useCallback((pose: SnapPose) => {
+    setPanels((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        position: pose.position,
+        quaternion: pose.quaternion,
+        width: PANEL_W,
+        height: PANEL_H,
+        depth: 0.18,
+      },
+    ]);
+  }, []);
 
   const snapHeightOffset = useCallback((value: number) => {
     const maxHeight = GRID_SIZE / 2;
@@ -785,6 +911,8 @@ export default function SolarViewer() {
     setSelectedGridCells(new Set());
     setPlacementMode(null);
     setSelectedSlots(new Set());
+    setFreePlacementMode(false);
+    setHoverPose(null);
     try {
       const arrayBuffer = await file.arrayBuffer();
       const gltf = await gltfLoader.parseAsync(arrayBuffer, "");
@@ -795,6 +923,8 @@ export default function SolarViewer() {
           m.receiveShadow = true;
         }
       });
+      // BVH-accelerate raycasts (R3F pointer events) on the high-poly mesh.
+      indexModelForBVH(gltf.scene);
       const box = new THREE.Box3().setFromObject(gltf.scene);
       const center = box.getCenter(new THREE.Vector3());
       setModelGroundZ(box.min.z);
@@ -946,6 +1076,7 @@ export default function SolarViewer() {
     setGridSelectionMode(false);
     setSelectedSlots(new Set());
     setPlacementMode(null);
+    setHoverPose(null);
     setError(null);
   }, []);
 
@@ -997,6 +1128,10 @@ export default function SolarViewer() {
               gridSelectionMode={gridSelectionMode}
               selectedGridCells={selectedGridCells}
               onToggleGridCell={toggleGridCell}
+              freePlacementMode={freePlacementMode}
+              hoverPose={hoverPose}
+              onSnapHover={setHoverPose}
+              onSnapPlace={placeFromSnap}
             />
           </Suspense>
         </Canvas>
@@ -1031,6 +1166,16 @@ export default function SolarViewer() {
           className="hidden"
           onChange={(e) => handleFiles(e.target.files)}
         />
+
+        {/* Live placement HUD — only while free-placement is active and we have a target. */}
+        {freePlacementMode && recommendation && (
+          <PlacementHUD
+            panelsPlaced={panels.length}
+            targetPanels={recommendation.design.panels_needed}
+            pricePerPanel={PRICE_PER_PANEL}
+            baseCost={recommendation.design.recommended_battery_kwh * PRICE_PER_KWH_BATTERY}
+          />
+        )}
 
         {/* Top-left filename badge */}
         {fileName && (
@@ -1352,6 +1497,20 @@ export default function SolarViewer() {
             <Sun className="mr-2 h-4 w-4" />
             Place Solar Panels
           </Button>
+
+          <Button
+            variant={freePlacementMode ? "default" : "outline"}
+            className="w-full"
+            onClick={() => {
+              setFreePlacementMode((v) => !v);
+              setHoverPose(null);
+            }}
+            disabled={!model || loading}
+          >
+            <MousePointerClick className="mr-2 h-4 w-4" />
+            {freePlacementMode ? "Stop free placement" : "Free placement (hover & click)"}
+          </Button>
+
           <Button
             variant="outline"
             className="w-full"
