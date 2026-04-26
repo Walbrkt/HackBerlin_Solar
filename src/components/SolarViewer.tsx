@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useRef, useState, Suspense, useEffect } from "react";
-import { Canvas, useThree } from "@react-three/fiber";
+import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { OrbitControls, Grid, Environment } from "@react-three/drei";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -16,42 +16,31 @@ gltfLoader.setDRACOLoader(dracoLoader);
 gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3, Sparkles, MousePointerClick } from "lucide-react";
+import { Upload, Sun, Trash2, Euro, Ruler, Grid3x3, Sparkles } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-// Cost per panel in euros (typical residential panel ~ €250)
 const COST_PER_PANEL = 250;
-// Typical residential panel size in meters
 const PANEL_W = 1.0;
 const PANEL_H = 1.65;
 const PANEL_GAP = 0.05;
+const GRID_SIZE = 150;
+const GRID_DIVISIONS = 25;
+const GRID_CELL_HEIGHT = GRID_SIZE / GRID_DIVISIONS;
 
 type PanelData = {
   id: string;
   position: [number, number, number];
-  // Quaternion so panels can be oriented for any "up" axis
   quaternion: [number, number, number, number];
   width: number;
   height: number;
+  depth?: number;
 };
 
-// A candidate flat surface with a precomputed grid of potential panel slots.
 type Candidate = {
   id: string;
   quaternion: [number, number, number, number];
-  // Centers + sizes for every slot in this candidate's grid
   slots: PanelData[];
-  // Outline corners for the holographic overlay (4 world-space points)
   outline: [number, number, number][];
-  // Plane height (for sorting)
   height: number;
 };
 
@@ -67,10 +56,13 @@ function Panel({
   onRemove: (id: string) => void;
 }) {
   const [hovered, setHovered] = useState(false);
+  const boxThickness = data.depth ?? (hovered ? 0.42 : 0.28);
   return (
     <mesh
       position={data.position}
       quaternion={data.quaternion}
+      castShadow
+      receiveShadow
       onClick={(e) => {
         e.stopPropagation();
         onRemove(data.id);
@@ -85,30 +77,27 @@ function Panel({
         document.body.style.cursor = "auto";
       }}
     >
-      <boxGeometry args={[data.width, data.height, 0.06]} />
+      <boxGeometry args={[data.width, data.height, boxThickness]} />
       <meshStandardMaterial
-        color={hovered ? "hsl(140, 100%, 65%)" : "hsl(140, 100%, 50%)"}
-        metalness={0.3}
-        roughness={0.4}
-        emissive="hsl(140, 100%, 45%)"
-        emissiveIntensity={hovered ? 0.9 : 0.55}
+        color={hovered ? "hsl(0, 0%, 12%)" : "hsl(0, 0%, 3%)"}
+        transparent={false}
+        opacity={1}
+        metalness={0.05}
+        roughness={0.9}
+        emissive="hsl(0, 0%, 22%)"
+        emissiveIntensity={hovered ? 0.8 : 0.55}
       />
     </mesh>
   );
 }
 
-// Holographic outline (semi-transparent glowing plane) for a candidate area
-function HoloArea({ candidate }: { candidate: Candidate }) {
-  // Compute centroid + dimensions from the slot bounds
+// Red semi-transparent overlay for a selected roof area (one plane per cell)
+function RoofHighlight({ candidate }: { candidate: Candidate }) {
   const { center, w, h } = useMemo(() => {
-    const xs = candidate.slots.map((s) => s.position[0]);
-    const ys = candidate.slots.map((s) => s.position[1]);
-    const zs = candidate.slots.map((s) => s.position[2]);
-    const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
-    const cy = (Math.min(...ys) + Math.max(...ys)) / 2;
-    const cz = (Math.min(...zs) + Math.max(...zs)) / 2;
-    // Use outline points to compute size
     const o = candidate.outline;
+    const cx = o.reduce((s, p) => s + p[0], 0) / o.length;
+    const cy = o.reduce((s, p) => s + p[1], 0) / o.length;
+    const cz = o.reduce((s, p) => s + p[2], 0) / o.length;
     const dU = new THREE.Vector3(...o[1]).sub(new THREE.Vector3(...o[0])).length();
     const dV = new THREE.Vector3(...o[3]).sub(new THREE.Vector3(...o[0])).length();
     return { center: [cx, cy, cz] as [number, number, number], w: dU, h: dV };
@@ -118,9 +107,9 @@ function HoloArea({ candidate }: { candidate: Candidate }) {
     <mesh position={center} quaternion={candidate.quaternion}>
       <planeGeometry args={[w, h]} />
       <meshBasicMaterial
-        color="hsl(180, 100%, 60%)"
+        color="hsl(0, 100%, 55%)"
         transparent
-        opacity={0.35}
+        opacity={0.45}
         side={THREE.DoubleSide}
         depthWrite={false}
       />
@@ -175,6 +164,253 @@ function SlotPicker({
   );
 }
 
+// 3D holographic coordinate grid system
+function CoordinateGrid({
+  size = GRID_SIZE,
+  divisions = GRID_DIVISIONS,
+  center = [0, 0, 0] as [number, number, number],
+  rotationZDeg = 0,
+}: {
+  size?: number;
+  divisions?: number;
+  center?: [number, number, number];
+  rotationZDeg?: number;
+}) {
+  const half = size / 2;
+  const step = size / divisions;
+
+  const lines: [number, number, number, number, number, number][] = [];
+
+  for (let y = -half; y <= half; y += step) {
+    for (let z = 0; z <= half; z += step) {
+      lines.push([-half, y, z, half, y, z]);
+    }
+  }
+
+  for (let x = -half; x <= half; x += step) {
+    for (let z = 0; z <= half; z += step) {
+      lines.push([x, -half, z, x, half, z]);
+    }
+  }
+
+  for (let x = -half; x <= half; x += step) {
+    for (let y = -half; y <= half; y += step) {
+      lines.push([x, y, 0, x, y, half]);
+    }
+  }
+
+  return (
+    <group position={center} rotation={[0, 0, (rotationZDeg * Math.PI) / 180]}>
+      {lines.map((line, idx) => (
+        <line key={`grid-${idx}`}>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              count={2}
+              array={new Float32Array(line)}
+              itemSize={3}
+            />
+          </bufferGeometry>
+          <lineBasicMaterial color={0x00ff88} transparent opacity={0.75} linewidth={3} fog={false} />
+        </line>
+      ))}
+
+      {/* X axis - red */}
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            count={2}
+            array={new Float32Array([-half, 0, 0, half, 0, 0])}
+            itemSize={3}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color={0xff0000} linewidth={4} fog={false} />
+      </line>
+
+      {/* Y axis - green */}
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            count={2}
+            array={new Float32Array([0, -half, 0, 0, half, 0])}
+            itemSize={3}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color={0x00ff00} linewidth={4} fog={false} />
+      </line>
+
+      {/* Z axis - blue */}
+      <line>
+        <bufferGeometry>
+          <bufferAttribute
+            attach="attributes-position"
+            count={2}
+            array={new Float32Array([0, 0, 0, 0, 0, half])}
+            itemSize={3}
+          />
+        </bufferGeometry>
+        <lineBasicMaterial color={0x0000ff} linewidth={4} fog={false} />
+      </line>
+
+      {/* Ground plane center marker */}
+      <mesh position={[0, 0, 0]}>
+        <sphereGeometry args={[0.5, 8, 8]} />
+        <meshBasicMaterial color={0xffffff} />
+      </mesh>
+    </group>
+  );
+}
+
+// A single clickable cell tile for the manual selection layer
+function SelectableGridCell({
+  col,
+  row,
+  size,
+  x,
+  y,
+  selected,
+  onToggle,
+}: {
+  col: number;
+  row: number;
+  size: number;
+  x: number;
+  y: number;
+  selected: boolean;
+  onToggle: (key: string) => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  const meshRef = useRef<THREE.Mesh>(null);
+  const key = `${col},${row}`;
+
+  useFrame(({ clock }) => {
+    if (!meshRef.current) return;
+    if (hovered && !selected) {
+      const pulse = 1 + 0.06 * Math.sin(clock.elapsedTime * 7.5);
+      meshRef.current.scale.set(pulse, pulse, 1);
+    } else {
+      meshRef.current.scale.set(1, 1, 1);
+    }
+  });
+
+  return (
+    <mesh
+      ref={meshRef}
+      position={[x, y, 0.015]}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle(key);
+      }}
+      onPointerOver={(e) => {
+        e.stopPropagation();
+        setHovered(true);
+        document.body.style.cursor = "pointer";
+      }}
+      onPointerOut={() => {
+        setHovered(false);
+        document.body.style.cursor = "auto";
+      }}
+    >
+      <planeGeometry args={[size - 0.15, size - 0.15]} />
+      <meshBasicMaterial
+        color={
+          selected
+            ? "hsl(0, 100%, 48%)"
+            : hovered
+              ? "hsl(190, 100%, 78%)"
+              : "hsl(190, 100%, 55%)"
+        }
+        transparent
+        opacity={selected ? 0.88 : hovered ? 0.52 : 0.12}
+        side={THREE.DoubleSide}
+        depthTest={false}
+        depthWrite={false}
+      />
+      {selected && (
+        <>
+          <mesh position={[0, 0, 0.01]}>
+            <planeGeometry args={[size - 0.03, size - 0.03]} />
+            <meshBasicMaterial
+              color="hsl(0, 100%, 25%)"
+              transparent
+              opacity={0.24}
+              side={THREE.DoubleSide}
+              depthTest={false}
+              depthWrite={false}
+            />
+          </mesh>
+          <lineLoop position={[0, 0, 0.02]}>
+            <bufferGeometry>
+              <bufferAttribute
+                attach="attributes-position"
+                count={4}
+                array={new Float32Array([
+                  -(size / 2) + 0.04, -(size / 2) + 0.04, 0,
+                  (size / 2) - 0.04, -(size / 2) + 0.04, 0,
+                  (size / 2) - 0.04, (size / 2) - 0.04, 0,
+                  -(size / 2) + 0.04, (size / 2) - 0.04, 0,
+                ])}
+                itemSize={3}
+              />
+            </bufferGeometry>
+            <lineBasicMaterial color="hsl(0, 100%, 65%)" transparent opacity={0.9} />
+          </lineLoop>
+        </>
+      )}
+    </mesh>
+  );
+}
+
+// Full 25×25 grid of selectable cells at the chosen height
+function SelectableGridLayer({
+  size = GRID_SIZE,
+  divisions = GRID_DIVISIONS,
+  center,
+  rotationZDeg,
+  heightOffset,
+  selectedCells,
+  onToggleCell,
+}: {
+  size?: number;
+  divisions?: number;
+  center: [number, number, number];
+  rotationZDeg: number;
+  heightOffset: number;
+  selectedCells: Set<string>;
+  onToggleCell: (key: string) => void;
+}) {
+  const step = size / divisions;
+  const half = size / 2;
+  return (
+    <group
+      position={[center[0], center[1], center[2] + heightOffset]}
+      rotation={[0, 0, (rotationZDeg * Math.PI) / 180]}
+    >
+      {Array.from({ length: divisions }, (_, row) =>
+        Array.from({ length: divisions }, (_, col) => {
+          const x = -half + (col + 0.5) * step;
+          const y = -half + (row + 0.5) * step;
+          const key = `${col},${row}`;
+          return (
+            <SelectableGridCell
+              key={key}
+              col={col}
+              row={row}
+              size={step}
+              x={x}
+              y={y}
+              selected={selectedCells.has(key)}
+              onToggle={onToggleCell}
+            />
+          );
+        })
+      )}
+    </group>
+  );
+}
+
 function SceneContent({
   model,
   panels,
@@ -183,6 +419,14 @@ function SceneContent({
   pickingSlots,
   selectedSlots,
   onToggleSlot,
+  showCoordinateGrid,
+  gridRotationZDeg,
+  gridPanX,
+  gridPanY,
+  gridHeightOffset,
+  gridSelectionMode,
+  selectedGridCells,
+  onToggleGridCell,
 }: {
   model: THREE.Object3D | null;
   panels: PanelData[];
@@ -191,20 +435,36 @@ function SceneContent({
   pickingSlots: PanelData[] | null;
   selectedSlots: Set<string>;
   onToggleSlot: (id: string) => void;
+  showCoordinateGrid: boolean;
+  gridRotationZDeg: number;
+  gridPanX: number;
+  gridPanY: number;
+  gridHeightOffset: number;
+  gridSelectionMode: boolean;
+  selectedGridCells: Set<string>;
+  onToggleGridCell: (key: string) => void;
 }) {
   const { camera } = useThree();
+  const modelGridOriginRef = useRef<[number, number, number]>([0, 0, 0]);
 
   useEffect(() => {
     if (!model) return;
     const box = new THREE.Box3().setFromObject(model);
     const size = box.getSize(new THREE.Vector3()).length();
     const center = box.getCenter(new THREE.Vector3());
+    modelGridOriginRef.current = [center.x, center.y, box.min.z];
     camera.position.set(center.x + size, center.y + size * 0.6, center.z + size);
     camera.lookAt(center);
     (camera as THREE.PerspectiveCamera).near = size / 100;
     (camera as THREE.PerspectiveCamera).far = size * 100;
     camera.updateProjectionMatrix();
   }, [model, camera]);
+
+  const gridCenter: [number, number, number] = [
+    modelGridOriginRef.current[0] + gridPanX,
+    modelGridOriginRef.current[1] + gridPanY,
+    modelGridOriginRef.current[2],
+  ];
 
   return (
     <>
@@ -217,7 +477,7 @@ function SceneContent({
         <Panel key={p.id} data={p} onRemove={onRemovePanel} />
       ))}
       {highlights.map((c) => (
-        <HoloArea key={c.id} candidate={c} />
+        <RoofHighlight key={c.id} candidate={c} />
       ))}
       {pickingSlots?.map((s) => (
         <SlotPicker
@@ -227,6 +487,23 @@ function SceneContent({
           onToggle={onToggleSlot}
         />
       ))}
+      {showCoordinateGrid && (
+        <CoordinateGrid
+          size={150}
+          divisions={25}
+          center={gridCenter}
+          rotationZDeg={gridRotationZDeg}
+        />
+      )}
+      {gridSelectionMode && (
+        <SelectableGridLayer
+          center={gridCenter}
+          rotationZDeg={gridRotationZDeg}
+          heightOffset={gridHeightOffset}
+          selectedCells={selectedGridCells}
+          onToggleCell={onToggleGridCell}
+        />
+      )}
       {!model && (
         <Grid
           args={[20, 20]}
@@ -241,155 +518,46 @@ function SceneContent({
   );
 }
 
-/**
- * Find ALL meaningful flat horizontal surfaces in the model.
- * Returns one Candidate per surface, each with its own grid of slots.
- */
-function findCandidateSurfaces(model: THREE.Object3D): Candidate[] {
-  type Tri = {
-    area: number;
-    centroid: THREE.Vector3;
-    normal: THREE.Vector3;
-  };
-  const tris: Tri[] = [];
-
-  model.updateMatrixWorld(true);
-
-  model.traverse((obj) => {
-    const mesh = obj as THREE.Mesh;
-    if (!(mesh.isMesh && mesh.geometry)) return;
-    const geom = mesh.geometry as THREE.BufferGeometry;
-    const pos = geom.attributes.position as THREE.BufferAttribute | undefined;
-    if (!pos) return;
-
-    const idx = geom.index;
-    const triCount = idx ? idx.count / 3 : pos.count / 3;
-    const a = new THREE.Vector3();
-    const b = new THREE.Vector3();
-    const c = new THREE.Vector3();
-    const ab = new THREE.Vector3();
-    const ac = new THREE.Vector3();
-
-    for (let i = 0; i < triCount; i++) {
-      const i0 = idx ? idx.getX(i * 3) : i * 3;
-      const i1 = idx ? idx.getX(i * 3 + 1) : i * 3 + 1;
-      const i2 = idx ? idx.getX(i * 3 + 2) : i * 3 + 2;
-
-      a.fromBufferAttribute(pos, i0).applyMatrix4(mesh.matrixWorld);
-      b.fromBufferAttribute(pos, i1).applyMatrix4(mesh.matrixWorld);
-      c.fromBufferAttribute(pos, i2).applyMatrix4(mesh.matrixWorld);
-
-      ab.subVectors(b, a);
-      ac.subVectors(c, a);
-      const cross = new THREE.Vector3().crossVectors(ab, ac);
-      const area = cross.length() * 0.5;
-      if (area < 1e-6) continue;
-      const normal = cross.normalize();
-
-      const centroid = new THREE.Vector3()
-        .add(a)
-        .add(b)
-        .add(c)
-        .multiplyScalar(1 / 3);
-
-      tris.push({ area, centroid, normal });
-    }
-  });
-
-  if (tris.length === 0) return [];
-
-  // Detect up axis
-  let areaY = 0;
-  let areaZ = 0;
-  for (const t of tris) {
-    areaY += Math.abs(t.normal.y) * t.area;
-    areaZ += Math.abs(t.normal.z) * t.area;
-  }
-  const upAxis = new THREE.Vector3(0, 1, 0);
-  if (areaZ > areaY) upAxis.set(0, 0, 1);
-
-  const flatTris = tris.filter((t) => t.normal.dot(upAxis) > 0.95);
-  if (flatTris.length === 0) return [];
-
-  const upHeight = (v: THREE.Vector3) => v.dot(upAxis);
-
-  // Cluster flat tris by height (greedy buckets)
-  const sorted = [...flatTris].sort(
-    (a, b) => upHeight(b.centroid) - upHeight(a.centroid)
-  );
-  const tol = 0.25;
-  const clusters: Tri[][] = [];
-  for (const t of sorted) {
-    const h = upHeight(t.centroid);
-    const c = clusters.find(
-      (cl) => Math.abs(upHeight(cl[0].centroid) - h) <= tol
-    );
-    if (c) c.push(t);
-    else clusters.push([t]);
-  }
-
-  // Build coordinate frame
-  const axisU = new THREE.Vector3();
-  const axisV = new THREE.Vector3();
-  if (upAxis.y === 1) {
-    axisU.set(1, 0, 0);
-    axisV.set(0, 0, 1);
-  } else {
-    axisU.set(1, 0, 0);
-    axisV.set(0, 1, 0);
-  }
-
-  const q = new THREE.Quaternion().setFromUnitVectors(
-    new THREE.Vector3(0, 0, 1),
-    upAxis
-  );
+// Converts selected grid cell keys to Candidate[] for the placement flow
+function gridCellsToHighlights(
+  cells: Set<string>,
+  gridCX: number,
+  gridCY: number,
+  gridCZ: number,
+  rotationZDeg: number,
+  heightOffset: number,
+): Candidate[] {
+  const step = GRID_SIZE / GRID_DIVISIONS;
+  const half = GRID_SIZE / 2;
+  const angle = (rotationZDeg * Math.PI) / 180;
+  const cosA = Math.cos(angle);
+  const sinA = Math.sin(angle);
+  const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, angle));
   const quat: [number, number, number, number] = [q.x, q.y, q.z, q.w];
+  const worldZ = gridCZ + heightOffset + 0.08;
 
-  const toWorld = (u: number, v: number, h: number): [number, number, number] => {
-    const p = new THREE.Vector3()
-      .addScaledVector(axisU, u)
-      .addScaledVector(axisV, v)
-      .addScaledVector(upAxis, h);
-    return [p.x, p.y, p.z];
-  };
+  const panelCols = Math.floor((step + PANEL_GAP) / (PANEL_W + PANEL_GAP));
+  const panelRows = Math.floor((step + PANEL_GAP) / (PANEL_H + PANEL_GAP));
+  const totalW = panelCols * PANEL_W + (panelCols - 1) * PANEL_GAP;
+  const totalH = panelRows * PANEL_H + (panelRows - 1) * PANEL_GAP;
+  const startU = -totalW / 2 + PANEL_W / 2;
+  const startV = -totalH / 2 + PANEL_H / 2;
 
-  const lift = 0.08;
-  const candidates: Candidate[] = [];
-
-  for (const cluster of clusters) {
-    const totalArea = cluster.reduce((s, t) => s + t.area, 0);
-    if (totalArea < 2.0) continue; // ignore tiny patches
-
-    const refH = upHeight(cluster[0].centroid);
-    const us = cluster.map((t) => t.centroid.dot(axisU));
-    const vs = cluster.map((t) => t.centroid.dot(axisV));
-    const minU = Math.min(...us);
-    const maxU = Math.max(...us);
-    const minV = Math.min(...vs);
-    const maxV = Math.max(...vs);
-    const width = maxU - minU;
-    const depth = maxV - minV;
-    if (width < PANEL_W || depth < PANEL_H) continue;
-
-    const cols = Math.floor((width + PANEL_GAP) / (PANEL_W + PANEL_GAP));
-    const rows = Math.floor((depth + PANEL_GAP) / (PANEL_H + PANEL_GAP));
-    if (cols < 1 || rows < 1) continue;
-
-    const totalW = cols * PANEL_W + (cols - 1) * PANEL_GAP;
-    const totalD = rows * PANEL_H + (rows - 1) * PANEL_GAP;
-    const startU = (minU + maxU) / 2 - totalW / 2 + PANEL_W / 2;
-    const startV = (minV + maxV) / 2 - totalD / 2 + PANEL_H / 2;
+  return Array.from(cells).map((key) => {
+    const [c, r] = key.split(",").map(Number);
+    const lx = -half + (c + 0.5) * step;
+    const ly = -half + (r + 0.5) * step;
+    const wx = gridCX + lx * cosA - ly * sinA;
+    const wy = gridCY + lx * sinA + ly * cosA;
 
     const slots: PanelData[] = [];
-    for (let r = 0; r < rows; r++) {
-      for (let c = 0; c < cols; c++) {
+    for (let ri = 0; ri < panelRows; ri++) {
+      for (let ci = 0; ci < panelCols; ci++) {
+        const u = startU + ci * (PANEL_W + PANEL_GAP);
+        const v = startV + ri * (PANEL_H + PANEL_GAP);
         slots.push({
           id: crypto.randomUUID(),
-          position: toWorld(
-            startU + c * (PANEL_W + PANEL_GAP),
-            startV + r * (PANEL_H + PANEL_GAP),
-            refH + lift
-          ),
+          position: [wx + u * cosA - v * sinA, wy + u * sinA + v * cosA, worldZ],
           quaternion: quat,
           width: PANEL_W,
           height: PANEL_H,
@@ -397,29 +565,13 @@ function findCandidateSurfaces(model: THREE.Object3D): Candidate[] {
       }
     }
 
-    const u0 = (minU + maxU) / 2 - totalW / 2;
-    const u1 = (minU + maxU) / 2 + totalW / 2;
-    const v0 = (minV + maxV) / 2 - totalD / 2;
-    const v1 = (minV + maxV) / 2 + totalD / 2;
-    const outline: [number, number, number][] = [
-      toWorld(u0, v0, refH + lift * 0.5),
-      toWorld(u1, v0, refH + lift * 0.5),
-      toWorld(u1, v1, refH + lift * 0.5),
-      toWorld(u0, v1, refH + lift * 0.5),
-    ];
+    const hw = step / 2;
+    const outline: [number, number, number][] = (
+      [[-hw, -hw], [hw, -hw], [hw, hw], [-hw, hw]] as [number, number][]
+    ).map(([u, v]) => [wx + u * cosA - v * sinA, wy + u * sinA + v * cosA, worldZ]);
 
-    candidates.push({
-      id: crypto.randomUUID(),
-      quaternion: quat,
-      slots,
-      outline,
-      height: refH,
-    });
-  }
-
-  // Sort highest first
-  candidates.sort((a, b) => b.height - a.height);
-  return candidates;
+    return { id: `cell-${c}-${r}`, quaternion: quat, slots, outline, height: worldZ };
+  });
 }
 
 type PlacementMode = null | "choose" | "picking";
@@ -435,7 +587,52 @@ export default function SolarViewer() {
   const [showHighlights, setShowHighlights] = useState(false);
   const [placementMode, setPlacementMode] = useState<PlacementMode>(null);
   const [selectedSlots, setSelectedSlots] = useState<Set<string>>(new Set());
+  const [showCoordinateGrid, setShowCoordinateGrid] = useState(false);
+  const [gridRotationZDeg, setGridRotationZDeg] = useState(0);
+  const [gridPanX, setGridPanX] = useState(0);
+  const [gridPanY, setGridPanY] = useState(0);
+  const [gridHeightOffset, setGridHeightOffset] = useState(0);
+  const [gridRotationInput, setGridRotationInput] = useState("0");
+  const [gridPanXInput, setGridPanXInput] = useState("0");
+  const [gridPanYInput, setGridPanYInput] = useState("0");
+  const [gridHeightInput, setGridHeightInput] = useState("0");
+  const [gridConfigured, setGridConfigured] = useState(false);
+  const [modelGroundZ, setModelGroundZ] = useState(0);
+  const [modelCenterXY, setModelCenterXY] = useState<[number, number]>([0, 0]);
+  const [gridSelectionMode, setGridSelectionMode] = useState(false);
+  const [selectedGridCells, setSelectedGridCells] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const snapHeightOffset = useCallback((value: number) => {
+    const maxHeight = GRID_SIZE / 2;
+    const clamped = Math.max(-maxHeight, Math.min(maxHeight, value));
+    return Math.round(clamped / GRID_CELL_HEIGHT) * GRID_CELL_HEIGHT;
+  }, []);
+
+  useEffect(() => {
+    setGridRotationInput(String(gridRotationZDeg));
+  }, [gridRotationZDeg]);
+
+  useEffect(() => {
+    setGridPanXInput(String(gridPanX));
+  }, [gridPanX]);
+
+  useEffect(() => {
+    setGridPanYInput(String(gridPanY));
+  }, [gridPanY]);
+
+  useEffect(() => {
+    setGridHeightInput(String(gridHeightOffset));
+  }, [gridHeightOffset]);
+
+  const handleGridControlChange = useCallback(() => {
+    setGridConfigured(false);
+    setShowHighlights(false);
+    setHighlights([]);
+    setSelectedGridCells(new Set());
+    setGridSelectionMode(false);
+    setError(null);
+  }, []);
 
   const loadGlb = useCallback(async (file: File) => {
     setLoading(true);
@@ -443,6 +640,13 @@ export default function SolarViewer() {
     setPanels([]);
     setHighlights([]);
     setShowHighlights(false);
+    setGridRotationZDeg(0);
+    setGridPanX(0);
+    setGridPanY(0);
+    setGridHeightOffset(0);
+    setGridConfigured(false);
+    setGridSelectionMode(false);
+    setSelectedGridCells(new Set());
     setPlacementMode(null);
     setSelectedSlots(new Set());
     try {
@@ -455,6 +659,10 @@ export default function SolarViewer() {
           m.receiveShadow = true;
         }
       });
+      const box = new THREE.Box3().setFromObject(gltf.scene);
+      const center = box.getCenter(new THREE.Vector3());
+      setModelGroundZ(box.min.z);
+      setModelCenterXY([center.x, center.y]);
       setModel(gltf.scene);
       setFileName(file.name);
     } catch (e) {
@@ -487,49 +695,82 @@ export default function SolarViewer() {
     [handleFiles]
   );
 
-  // Compute candidates lazily
-  const ensureCandidates = useCallback((): Candidate[] => {
-    if (!model) return [];
-    if (highlights.length > 0) return highlights;
-    const found = findCandidateSurfaces(model);
-    setHighlights(found);
-    return found;
-  }, [model, highlights]);
-
-  const toggleHighlights = useCallback(() => {
-    if (!model) return;
-    const found = ensureCandidates();
-    if (found.length === 0) {
-      setError("No flat horizontal surfaces detected on this model.");
-      return;
-    }
+  const placeSelectedAreas = useCallback((sourceHighlights?: Candidate[]) => {
+    const areas = sourceHighlights ?? highlights;
+    if (areas.length === 0) return;
+    const cellSize = GRID_SIZE / GRID_DIVISIONS;
+    const boxDepth = cellSize * 0.95;
+    const cellPanels = areas.map((c) => {
+      const center: [number, number, number] = [
+        c.outline.reduce((sum, p) => sum + p[0], 0) / c.outline.length,
+        c.outline.reduce((sum, p) => sum + p[1], 0) / c.outline.length,
+        c.outline.reduce((sum, p) => sum + p[2], 0) / c.outline.length + boxDepth / 2,
+      ];
+      return {
+        id: crypto.randomUUID(),
+        position: center,
+        quaternion: c.quaternion,
+        width: cellSize - 0.08,
+        height: cellSize - 0.08,
+        depth: boxDepth,
+      } as PanelData;
+    });
+    setPanels(cellPanels);
+    setPlacementMode(null);
+    setShowHighlights(false);
+    setSelectedSlots(new Set());
     setError(null);
-    setShowHighlights((v) => !v);
-  }, [model, ensureCandidates]);
+  }, [highlights]);
+
+  const confirmGridSelection = useCallback(() => {
+    if (selectedGridCells.size === 0) return;
+    const h = gridCellsToHighlights(
+      selectedGridCells,
+      modelCenterXY[0] + gridPanX,
+      modelCenterXY[1] + gridPanY,
+      modelGroundZ,
+      gridRotationZDeg,
+      gridHeightOffset,
+    );
+    setHighlights(h);
+    setGridSelectionMode(false);
+    setError(null);
+    placeSelectedAreas(h);
+  }, [
+    selectedGridCells,
+    modelCenterXY,
+    gridPanX,
+    gridPanY,
+    modelGroundZ,
+    gridRotationZDeg,
+    gridHeightOffset,
+    placeSelectedAreas,
+  ]);
+
+  const toggleGridCell = useCallback((key: string) => {
+    setSelectedGridCells((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   const openPlacement = useCallback(() => {
     if (!model) return;
-    const found = ensureCandidates();
-    if (found.length === 0) {
-      setError("No flat horizontal surfaces detected on this model.");
+    if (!gridConfigured) {
+      setError("Set the grid first, then click Place Solar Panels.");
       return;
     }
-    setError(null);
-    setPlacementMode("choose");
-  }, [model, ensureCandidates]);
-
-  const placeRecommended = useCallback(() => {
-    const all = highlights.flatMap((c) => c.slots);
-    setPanels(all.map((s) => ({ ...s, id: crypto.randomUUID() })));
-    setPlacementMode(null);
-    setShowHighlights(false);
-  }, [highlights]);
-
-  const startPicking = useCallback(() => {
-    setSelectedSlots(new Set());
-    setPlacementMode("picking");
-    setShowHighlights(false);
-  }, []);
+    if (highlights.length === 0) {
+      setShowCoordinateGrid(true);
+      setSelectedGridCells(new Set());
+      setGridSelectionMode(true);
+      setError("Select roof cells, then click Confirm.");
+      return;
+    }
+    placeSelectedAreas();
+  }, [model, gridConfigured, highlights, placeSelectedAreas]);
 
   const toggleSlot = useCallback((id: string) => {
     setSelectedSlots((prev) => {
@@ -557,7 +798,16 @@ export default function SolarViewer() {
     setPanels((prev) => prev.filter((p) => p.id !== id));
   }, []);
 
-  const clearPanels = useCallback(() => setPanels([]), []);
+  const clearPanels = useCallback(() => {
+    setPanels([]);
+    setHighlights([]);
+    setShowHighlights(false);
+    setSelectedGridCells(new Set());
+    setGridSelectionMode(false);
+    setSelectedSlots(new Set());
+    setPlacementMode(null);
+    setError(null);
+  }, []);
 
   const stats = useMemo(() => {
     const area = panels.reduce((s, p) => s + p.width * p.height, 0);
@@ -598,6 +848,14 @@ export default function SolarViewer() {
               pickingSlots={pickingSlots}
               selectedSlots={selectedSlots}
               onToggleSlot={toggleSlot}
+              showCoordinateGrid={showCoordinateGrid}
+              gridRotationZDeg={gridRotationZDeg}
+              gridPanX={gridPanX}
+              gridPanY={gridPanY}
+              gridHeightOffset={gridHeightOffset}
+              gridSelectionMode={gridSelectionMode}
+              selectedGridCells={selectedGridCells}
+              onToggleGridCell={toggleGridCell}
             />
           </Suspense>
         </Canvas>
@@ -677,19 +935,263 @@ export default function SolarViewer() {
         </div>
 
         <div className="space-y-3 p-5">
+          {/* Grid selection mode banner */}
+          {gridSelectionMode && (
+            <div className="rounded-md border border-primary bg-primary/10 p-3 text-sm">
+              <p className="mb-1 font-medium">Click grid cells on the roof</p>
+              <p className="mb-3 text-xs text-muted-foreground">
+                {selectedGridCells.size} cell{selectedGridCells.size === 1 ? "" : "s"} selected
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  className="flex-1"
+                  onClick={confirmGridSelection}
+                  disabled={selectedGridCells.size === 0}
+                >
+                  Confirm
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setSelectedGridCells(new Set())}
+                >
+                  Clear
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setGridSelectionMode(false);
+                    setSelectedGridCells(new Set());
+                  }}
+                >
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          )}
+
           <Button
             variant="outline"
             className="w-full"
-            onClick={toggleHighlights}
+            onClick={() => setShowCoordinateGrid(!showCoordinateGrid)}
             disabled={!model || loading}
           >
-            <Sparkles className="mr-2 h-4 w-4" />
-            {showHighlights ? "Hide possible areas" : "Highlight possible areas"}
+            <Grid3x3 className="mr-2 h-4 w-4" />
+            {showCoordinateGrid ? "Hide coordinate grid" : "Show coordinate grid"}
           </Button>
+
+          {showCoordinateGrid && (
+            <div className="space-y-2 rounded-md border border-border bg-background/60 p-3">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-muted-foreground">Grid rotation (Z)</span>
+                <span className="font-semibold text-foreground">{gridRotationZDeg.toFixed(1)}°</span>
+              </div>
+              <input
+                type="range"
+                min={-180}
+                max={180}
+                step={0.1}
+                value={gridRotationZDeg}
+                onChange={(e) => {
+                  setGridRotationZDeg(Number(e.target.value));
+                  handleGridControlChange();
+                }}
+                className="w-full accent-primary"
+              />
+              <input
+                type="number"
+                min={-180}
+                max={180}
+                step={0.1}
+                value={gridRotationInput}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setGridRotationInput(raw);
+                  if (raw === "" || raw === "-" || raw === "." || raw === "-.") return;
+                  const next = Number(raw);
+                  if (Number.isNaN(next)) return;
+                  setGridRotationZDeg(next);
+                  handleGridControlChange();
+                }}
+                onBlur={() => {
+                  const next = Number(gridRotationInput);
+                  if (Number.isNaN(next)) {
+                    setGridRotationInput(String(gridRotationZDeg));
+                    return;
+                  }
+                  const clamped = Math.max(-180, Math.min(180, next));
+                  setGridRotationZDeg(clamped);
+                }}
+                className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+              />
+
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-muted-foreground">Grid pan X</span>
+                <span className="font-semibold text-foreground">{gridPanX.toFixed(1)} m</span>
+              </div>
+              <input
+                type="range"
+                min={-100}
+                max={100}
+                step={0.1}
+                value={gridPanX}
+                onChange={(e) => {
+                  setGridPanX(Number(e.target.value));
+                  handleGridControlChange();
+                }}
+                className="w-full accent-primary"
+              />
+              <input
+                type="number"
+                min={-100}
+                max={100}
+                step={0.1}
+                value={gridPanXInput}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setGridPanXInput(raw);
+                  if (raw === "" || raw === "-" || raw === "." || raw === "-.") return;
+                  const next = Number(raw);
+                  if (Number.isNaN(next)) return;
+                  setGridPanX(next);
+                  handleGridControlChange();
+                }}
+                onBlur={() => {
+                  const next = Number(gridPanXInput);
+                  if (Number.isNaN(next)) {
+                    setGridPanXInput(String(gridPanX));
+                    return;
+                  }
+                  const clamped = Math.max(-100, Math.min(100, next));
+                  setGridPanX(clamped);
+                }}
+                className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+              />
+
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-muted-foreground">Grid pan Y</span>
+                <span className="font-semibold text-foreground">{gridPanY.toFixed(1)} m</span>
+              </div>
+              <input
+                type="range"
+                min={-100}
+                max={100}
+                step={0.1}
+                value={gridPanY}
+                onChange={(e) => {
+                  setGridPanY(Number(e.target.value));
+                  handleGridControlChange();
+                }}
+                className="w-full accent-primary"
+              />
+              <input
+                type="number"
+                min={-100}
+                max={100}
+                step={0.1}
+                value={gridPanYInput}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setGridPanYInput(raw);
+                  if (raw === "" || raw === "-" || raw === "." || raw === "-.") return;
+                  const next = Number(raw);
+                  if (Number.isNaN(next)) return;
+                  setGridPanY(next);
+                  handleGridControlChange();
+                }}
+                onBlur={() => {
+                  const next = Number(gridPanYInput);
+                  if (Number.isNaN(next)) {
+                    setGridPanYInput(String(gridPanY));
+                    return;
+                  }
+                  const clamped = Math.max(-100, Math.min(100, next));
+                  setGridPanY(clamped);
+                }}
+                className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+              />
+
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-muted-foreground">Selection height</span>
+                <span className="font-semibold text-foreground">{gridHeightOffset.toFixed(1)} m</span>
+              </div>
+              <input
+                type="range"
+                min={-GRID_SIZE / 2}
+                max={GRID_SIZE / 2}
+                step={GRID_CELL_HEIGHT}
+                value={gridHeightOffset}
+                onChange={(e) => {
+                  setGridHeightOffset(snapHeightOffset(Number(e.target.value)));
+                  handleGridControlChange();
+                }}
+                className="w-full accent-primary"
+              />
+              <input
+                type="number"
+                min={-GRID_SIZE / 2}
+                max={GRID_SIZE / 2}
+                step={GRID_CELL_HEIGHT}
+                value={gridHeightInput}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setGridHeightInput(raw);
+                  if (raw === "" || raw === "-" || raw === "." || raw === "-.") return;
+                  const next = Number(raw);
+                  if (Number.isNaN(next)) return;
+                  setGridHeightOffset(snapHeightOffset(next));
+                  handleGridControlChange();
+                }}
+                onBlur={() => {
+                  const next = Number(gridHeightInput);
+                  if (Number.isNaN(next)) {
+                    setGridHeightInput(String(gridHeightOffset));
+                    return;
+                  }
+                  setGridHeightOffset(snapHeightOffset(next));
+                }}
+                className="w-full rounded-md border border-border bg-background px-2 py-1 text-xs"
+              />
+
+              <Button
+                type="button"
+                size="sm"
+                className="w-full"
+                disabled={!model || loading}
+                onClick={() => {
+                  setGridConfigured(true);
+                  setGridSelectionMode(false);
+                  setError(null);
+                }}
+              >
+                <Sparkles className="mr-2 h-3 w-3" />
+                {gridConfigured ? "Grid Set" : "Set Grid"}
+              </Button>
+
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="w-full"
+                onClick={() => {
+                  setGridRotationZDeg(0);
+                  setGridPanX(0);
+                  setGridPanY(0);
+                  setGridHeightOffset(0);
+                  handleGridControlChange();
+                }}
+              >
+                Reset all grid controls
+              </Button>
+            </div>
+          )}
+
           <Button
             className="w-full"
             onClick={openPlacement}
-            disabled={!model || loading || placementMode === "picking"}
+            disabled={!model || loading || placementMode === "picking" || !gridConfigured}
           >
             <Sun className="mr-2 h-4 w-4" />
             Place Solar Panels
@@ -718,7 +1220,7 @@ export default function SolarViewer() {
           />
           <StatRow
             icon={<Ruler className="h-4 w-4" />}
-            label="Roof area covered"
+            label="Selected roof area"
             value={`${stats.area.toFixed(2)} m²`}
           />
           <StatRow
@@ -731,56 +1233,13 @@ export default function SolarViewer() {
 
         <div className="mt-auto border-t border-border p-5 text-xs text-muted-foreground">
           <p className="mb-1 font-medium text-foreground">Tip</p>
-          Click any green panel in the 3D view to remove it. Use "Highlight
-          possible areas" to preview where panels can go.
+          Show the coordinate grid, align it to your roof (pan, rotate, height), then
+          click "Set Grid". After that, use "Place Solar Panels" to mark which cells are on
+          the roof surface, then click Confirm to place panels immediately.
+          Click any placed panel to remove it.
         </div>
       </aside>
 
-      {/* Placement mode chooser */}
-      <Dialog
-        open={placementMode === "choose"}
-        onOpenChange={(o) => !o && setPlacementMode(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Place Solar Panels</DialogTitle>
-            <DialogDescription>
-              Choose how you want to lay out panels on the detected surfaces.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <button
-              onClick={placeRecommended}
-              className="flex flex-col items-start gap-2 rounded-lg border border-border bg-background/50 p-4 text-left transition-colors hover:border-primary hover:bg-primary/5"
-            >
-              <Sparkles className="h-5 w-5 text-primary" />
-              <div className="font-semibold">Use recommended</div>
-              <div className="text-xs text-muted-foreground">
-                Auto-fill every detected flat surface with a full grid of panels.
-              </div>
-              <div className="mt-1 text-xs text-primary">
-                {highlights.reduce((s, c) => s + c.slots.length, 0)} panels across{" "}
-                {highlights.length} surface{highlights.length === 1 ? "" : "s"}
-              </div>
-            </button>
-            <button
-              onClick={startPicking}
-              className="flex flex-col items-start gap-2 rounded-lg border border-border bg-background/50 p-4 text-left transition-colors hover:border-primary hover:bg-primary/5"
-            >
-              <MousePointerClick className="h-5 w-5 text-primary" />
-              <div className="font-semibold">Pick your own</div>
-              <div className="text-xs text-muted-foreground">
-                Click individual grid slots in the 3D view, then confirm to place.
-              </div>
-            </button>
-          </div>
-          <DialogFooter>
-            <Button variant="ghost" onClick={() => setPlacementMode(null)}>
-              Cancel
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </div>
   );
 }
