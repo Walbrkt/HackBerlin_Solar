@@ -1229,6 +1229,7 @@ export default function SolarViewer() {
     );
     setHighlights(h);
     setGridSelectionMode(false);
+    setShowCoordinateGrid(false);
     setError(null);
     placeSelectedAreas(h);
   }, [
